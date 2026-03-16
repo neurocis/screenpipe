@@ -32,7 +32,7 @@ const MIN_AGE_SECS: i64 = 600; // 10 minutes
 const POLL_INTERVAL_SECS: u64 = 300; // 5 minutes
 
 /// Maximum frames per MP4 chunk at normal thermal load.
-const MAX_FRAMES_PER_CHUNK: usize = 500;
+const MAX_FRAMES_PER_CHUNK: usize = 100;
 
 /// Smaller batch size when system is thermally stressed.
 const THROTTLED_FRAMES_PER_CHUNK: usize = 50;
@@ -302,7 +302,9 @@ async fn compact_chunk(
 
     // Only update frames that were actually encoded into the video.
     // Use their real video position as offset_index (not array index).
-    let mut tx = db.begin_immediate_with_retry().await?;
+    // Process in separate transactions per batch to avoid holding the write
+    // semaphore for too long, which starves audio/frame insertion and causes
+    // PoolTimedOut errors (data loss).
     for batch in encoded_frames.chunks(100) {
         let ids: Vec<i64> = batch.iter().map(|(id, _)| *id).collect();
         let placeholders: Vec<String> = ids.iter().map(|_| "?".to_string()).collect();
@@ -320,13 +322,16 @@ async fn compact_chunk(
             placeholders.join(",")
         );
 
+        let mut tx = db.begin_immediate_with_retry().await?;
         let mut query = sqlx::query(&sql).bind(chunk_id);
         for id in &ids {
             query = query.bind(id);
         }
         query.execute(&mut **tx.conn()).await?;
+        tx.commit().await?;
+        // Yield briefly between batches so audio/frame insertions can acquire the write semaphore
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
-    tx.commit().await?;
 
     // Step 3: Delete source JPEGs (safe — DB already points to MP4)
     let mut deleted = 0u32;
@@ -536,7 +541,7 @@ mod tests {
             ThermalState::Serious => (THROTTLED_FRAMES_PER_CHUNK, 30),
             ThermalState::Critical => (THROTTLED_FRAMES_PER_CHUNK, 120),
         };
-        assert_eq!(chunk_size, 500);
+        assert_eq!(chunk_size, 100);
         assert_eq!(delay, 0);
     }
 
