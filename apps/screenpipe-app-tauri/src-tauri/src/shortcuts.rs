@@ -28,6 +28,7 @@ struct ShortcutConfig {
     show_chat: String,
     search: String,
     lock_vault: String,
+    dictation: String,
     disabled: Vec<String>,
 }
 
@@ -65,9 +66,9 @@ impl ShortcutConfig {
             show_chat: store.show_chat_shortcut,
             search: store.search_shortcut,
             lock_vault: store.lock_vault_shortcut,
+            dictation: store.dictation_shortcut,
             disabled: store.disabled_shortcuts,
         })
-    }
 
     fn is_disabled(&self, shortcut_type: &str) -> bool {
         let frontend_key = match shortcut_type {
@@ -76,6 +77,7 @@ impl ShortcutConfig {
             "stop_recording" => "stopRecordingShortcut",
             "start_audio" => "startAudioShortcut",
             "stop_audio" => "stopAudioShortcut",
+            "dictation" => "dictationShortcut",
             "show_chat" => "showChatShortcut",
             "search" => "searchShortcut",
             "lock_vault" => "lockVaultShortcut",
@@ -268,6 +270,17 @@ async fn apply_shortcuts(app: &AppHandle, config: &ShortcutConfig) -> Result<(),
                 }
                 let _ = ShowRewindWindow::Chat.show(app);
             });
+        },
+    )
+    .await?;
+
+    register_shortcut(
+        app,
+        &config.dictation,
+        config.is_disabled("dictation"),
+        |app| {
+            let _ = app.emit("shortcut-dictation", ());
+            info!("dictation shortcut triggered");
         },
     )
     .await?;
