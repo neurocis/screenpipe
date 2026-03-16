@@ -309,6 +309,7 @@ pub async fn start_health_check(app: tauri::AppHandle) -> Result<()> {
     let mut consecutive_vision_stall: u32 = 0;
     let mut last_audio_notification: Option<Instant> = None;
     let mut last_vision_notification: Option<Instant> = None;
+    let mut wake_reset_done = false;
 
     tokio::spawn(async move {
         loop {
@@ -477,6 +478,22 @@ pub async fn start_health_check(app: tauri::AppHandle) -> Result<()> {
                         consecutive_vision_stall = 0;
                     }
 
+                    // After wake from sleep, reset stall counters and notification
+                    // cooldowns once so degraded recording is re-detected from scratch.
+                    // Only reset once per wake event to avoid suppressing the counter
+                    // for the entire 30s wake window.
+                    let woke = screenpipe_engine::sleep_monitor::recently_woke_from_sleep();
+                    if woke && !wake_reset_done {
+                        wake_reset_done = true;
+                        consecutive_audio_stall = 0;
+                        consecutive_vision_stall = 0;
+                        last_audio_notification = None;
+                        last_vision_notification = None;
+                    }
+                    if !woke {
+                        wake_reset_done = false;
+                    }
+
                     // Show notification if threshold hit and cooldown expired
                     let now_instant = Instant::now();
 
@@ -520,7 +537,16 @@ pub async fn start_health_check(app: tauri::AppHandle) -> Result<()> {
 }
 
 /// Show a notification telling the user that capture has stalled, with a restart button.
+/// Skips showing if the main overlay panel is visible — the notification panel
+/// steals focus and causes a deadlock with the overlay's focus-loss handler.
 async fn show_capture_stall_notification(app: &tauri::AppHandle, system: &str) -> Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        if crate::window::MAIN_PANEL_SHOWN.load(std::sync::atomic::Ordering::SeqCst) {
+            tracing::debug!("skipping capture stall notification — overlay is visible");
+            return Ok(());
+        }
+    }
     let payload = serde_json::json!({
         "id": format!("capture_stall_{}", system),
         "type": "capture_stall",

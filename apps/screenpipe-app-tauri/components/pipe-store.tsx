@@ -75,7 +75,7 @@ interface StorePipe {
   review_count: number;
   install_count: number;
   featured: boolean;
-  permissions: PipePermissions;
+  permissions?: PipePermissions;
   source?: string;
   readme_md?: string;
 }
@@ -131,7 +131,8 @@ const PERMISSION_LABELS: { key: string; label: string; icon: React.ReactNode }[]
   { key: "connections", label: "Connections", icon: <Plug className="h-3.5 w-3.5" /> },
 ];
 
-function getPermissionStatus(perms: PipePermissions, key: string): "allowed" | "denied" | "unset" {
+function getPermissionStatus(perms: PipePermissions | undefined, key: string): "allowed" | "denied" | "unset" {
+  if (!perms) return "unset";
   const allowKey = `allow_${key}` as keyof PipePermissions;
   const denyKey = `deny_${key}` as keyof PipePermissions;
   if (perms[denyKey] === true) return "denied";
@@ -140,7 +141,8 @@ function getPermissionStatus(perms: PipePermissions, key: string): "allowed" | "
   return "unset";
 }
 
-function isUnrestricted(perms: PipePermissions): boolean {
+function isUnrestricted(perms?: PipePermissions): boolean {
+  if (!perms) return true; // no permissions declared = unrestricted
   return (
     !perms.deny_ocr &&
     !perms.deny_audio &&
@@ -685,8 +687,8 @@ function FeaturedCard({
           </Badge>
           <div className="flex items-center gap-3 text-xs text-muted-foreground">
             <span className="flex items-center gap-1">
-              <StarRating rating={pipe.rating} />
-              <span>{pipe.rating.toFixed(1)}</span>
+              <StarRating rating={pipe.rating ?? 0} />
+              <span>{(pipe.rating ?? 0).toFixed(1)}</span>
             </span>
             <span className="flex items-center gap-1">
               <Download className="h-3 w-3" />
@@ -788,8 +790,8 @@ function PipeCard({
 
       <div className="flex items-center gap-3 mt-3 text-xs text-muted-foreground">
         <span className="flex items-center gap-1">
-          <StarRating rating={pipe.rating} />
-          <span>{pipe.rating.toFixed(1)}</span>
+          <StarRating rating={pipe.rating ?? 0} />
+          <span>{(pipe.rating ?? 0).toFixed(1)}</span>
         </span>
         <span className="flex items-center gap-1">
           <Download className="h-3 w-3" />
@@ -875,9 +877,9 @@ function PipeDetailPanel({
               </div>
               <div className="flex items-center gap-4 mt-2 text-sm text-muted-foreground">
                 <span className="flex items-center gap-1.5">
-                  <StarRating rating={pipe.rating} size="md" />
+                  <StarRating rating={pipe.rating ?? 0} size="md" />
                   <span>
-                    {pipe.rating.toFixed(1)} ({pipe.review_count}{" "}
+                    {(pipe.rating ?? 0).toFixed(1)} ({pipe.review_count}{" "}
                     {pipe.review_count === 1 ? "review" : "reviews"})
                   </span>
                 </span>
@@ -995,17 +997,17 @@ function PipeDetailPanel({
               );
             })}
           </div>
-          {pipe.permissions.time_range && (
+          {pipe.permissions?.time_range && (
             <div className="flex items-center gap-1.5 text-xs text-muted-foreground pt-2 border-t border-border">
               <Clock className="h-3.5 w-3.5" />
-              time range: {pipe.permissions.time_range}
+              time range: {pipe.permissions?.time_range}
             </div>
           )}
-          {pipe.permissions.day_restrictions &&
+          {pipe.permissions?.day_restrictions &&
             pipe.permissions.day_restrictions.length > 0 && (
               <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
                 <Clock className="h-3.5 w-3.5" />
-                days: {pipe.permissions.day_restrictions.join(", ")}
+                days: {pipe.permissions?.day_restrictions?.join(", ")}
               </div>
             )}
         </div>
@@ -1358,7 +1360,7 @@ export function PermissionsReview({
   permissions,
   authorVerified,
 }: {
-  permissions: PipePermissions;
+  permissions?: PipePermissions;
   authorVerified: boolean;
 }) {
   const unrestricted = isUnrestricted(permissions);
