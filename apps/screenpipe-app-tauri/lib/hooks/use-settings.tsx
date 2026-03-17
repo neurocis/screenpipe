@@ -144,6 +144,8 @@ export type Settings = SettingsStore & {
 	pipeSuggestionFrequencyHours?: number;
 	/** User's power mode preference — persisted so it survives app restarts */
 	powerMode?: "auto" | "performance" | "battery_saver";
+	/** Show restart notifications when audio/vision capture stalls (default: true) */
+	showRestartNotifications?: boolean;
 }
 
 export function getEffectiveFilters(settings: Settings) {

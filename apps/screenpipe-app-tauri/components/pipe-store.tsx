@@ -4,7 +4,8 @@
 
 "use client";
 
-import React, { useState, useEffect, useCallback, useRef } from "react";
+import React, { useState, useEffect, useCallback, useRef, useMemo } from "react";
+import { apiCache } from "@/lib/cache";
 import { Card, CardContent } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -196,7 +197,7 @@ function StarRating({
               className={cn(
                 iconSize,
                 filled
-                  ? "fill-yellow-500 text-yellow-500"
+                  ? "fill-foreground text-foreground"
                   : "text-muted-foreground/30"
               )}
             />
@@ -329,13 +330,21 @@ function DiscoverView() {
   // Installed pipe names (for "Installed" badge)
   const [installedNames, setInstalledNames] = useState<Set<string>>(new Set());
 
-  // Fetch installed pipes
+  // Fetch installed pipes (cached 30s, invalidated on install)
   useEffect(() => {
+    const cacheKey = "pipes/installed";
+    const cached = apiCache.get<Set<string>>(cacheKey);
+    if (cached) {
+      setInstalledNames(cached);
+      return;
+    }
     fetch("http://localhost:3030/pipes")
       .then((r) => r.json())
       .then((data) => {
         const list = Array.isArray(data) ? data : data.data || data.pipes || [];
-        setInstalledNames(new Set(list.map((p: any) => p.config?.name || p.name)));
+        const names = new Set<string>(list.map((p: any) => p.config?.name || p.name));
+        apiCache.set(cacheKey, names, 30_000);
+        setInstalledNames(names);
       })
       .catch(() => {});
   }, [showDetail]);
@@ -347,22 +356,36 @@ function DiscoverView() {
     return () => clearTimeout(debounceRef.current);
   }, [searchQuery]);
 
-  // Fetch pipes
+  // Fetch pipes with stale-while-revalidate caching
   const fetchPipes = useCallback(async () => {
-    setLoading(true);
+    const params = new URLSearchParams();
+    if (debouncedQuery) params.set("q", debouncedQuery);
+    if (category !== "All") params.set("category", category.toLowerCase());
+    if (sort) params.set("sort", sort);
+    const cacheKey = `pipes/store?${params}`;
+
+    // Show cached data immediately if available
+    const cached = apiCache.getStale<any[]>(cacheKey);
+    if (cached) {
+      setPipes(cached);
+      // If cache is still fresh, skip network request
+      if (apiCache.isFresh(cacheKey)) return;
+    } else {
+      setLoading(true);
+    }
+
+    // Fetch fresh data in background
     try {
-      const params = new URLSearchParams();
-      if (debouncedQuery) params.set("q", debouncedQuery);
-      if (category !== "All") params.set("category", category.toLowerCase());
-      if (sort) params.set("sort", sort);
       const res = await fetch(`http://localhost:3030/pipes/store?${params}`);
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data = await res.json();
       const list = data.data || data.pipes || (Array.isArray(data) ? data : []);
-      setPipes(list.map(normalizePipe));
+      const normalized = list.map(normalizePipe);
+      apiCache.set(cacheKey, normalized, 5 * 60_000); // 5 min TTL
+      setPipes(normalized);
     } catch (err) {
       console.error("failed to fetch pipe store:", err);
-      setPipes([]);
+      if (!cached) setPipes([]);
     } finally {
       setLoading(false);
     }
@@ -419,7 +442,8 @@ function DiscoverView() {
         title: `"${data.name || slug}" installed`,
         description: "switch to my pipes to configure and run it",
       });
-      // Refresh installed names
+      // Invalidate cache and update installed names
+      apiCache.invalidate("pipes/installed");
       setInstalledNames((prev) => new Set([...prev, data.name || slug]));
     } catch (err: any) {
       toast({
@@ -547,14 +571,14 @@ function DiscoverView() {
       {/* Header */}
       <div className="flex items-center justify-between">
         <div>
-          <h3 className="text-xl font-semibold tracking-tight">Discover Pipes</h3>
+          <h3 className="text-xl font-semibold tracking-tight">discover pipes</h3>
           <p className="text-sm text-muted-foreground mt-0.5">
             browse, install, and review community pipes
           </p>
         </div>
         <Button variant="outline" size="sm" onClick={() => setPublishOpen(true)}>
           <Upload className="h-4 w-4 mr-1.5" />
-          publish
+          PUBLISH
         </Button>
       </div>
 
@@ -591,7 +615,7 @@ function DiscoverView() {
               key={c}
               onClick={() => setCategory(c)}
               className={cn(
-                "px-3 py-1.5 rounded-full text-xs font-medium transition-colors whitespace-nowrap",
+                "px-3 py-1.5 rounded-none text-xs font-medium transition-colors duration-150 whitespace-nowrap",
                 category === c
                   ? "bg-foreground text-background"
                   : "bg-muted text-muted-foreground hover:text-foreground"
@@ -631,7 +655,7 @@ function DiscoverView() {
             <Card key={i} className="overflow-hidden">
               <CardContent className="p-5 space-y-3">
                 <div className="flex items-center gap-3">
-                  <Skeleton className="h-10 w-10 rounded-xl" />
+                  <Skeleton className="h-10 w-10 rounded-none" />
                   <div className="space-y-1.5 flex-1">
                     <Skeleton className="h-4 w-2/3" />
                     <Skeleton className="h-3 w-1/3" />
@@ -701,10 +725,10 @@ function FeaturedCard({
       className="flex-shrink-0 w-[300px] snap-start group cursor-pointer"
       onClick={onClick}
     >
-      <div className="border border-border bg-card hover:bg-accent/50 transition-all duration-200 rounded-xl p-5 space-y-3 h-full">
+      <div className="border border-border bg-card hover:bg-accent/50 transition-colors duration-150 rounded-none p-5 space-y-3 h-full">
         <div className="flex items-start justify-between">
           <div className="flex items-start gap-3">
-            <div className="text-3xl bg-muted rounded-xl h-12 w-12 flex items-center justify-center flex-shrink-0">
+            <div className="text-3xl bg-muted rounded-none h-12 w-12 flex items-center justify-center flex-shrink-0">
               {pipe.icon || "🔧"}
             </div>
             <div className="min-w-0">
@@ -714,7 +738,7 @@ function FeaturedCard({
               <div className="flex items-center gap-1 text-xs text-muted-foreground mt-0.5">
                 <span className="truncate">{pipe.author}</span>
                 {pipe.author_verified && (
-                  <BadgeCheck className="h-3 w-3 text-blue-500 flex-shrink-0" />
+                  <BadgeCheck className="h-3 w-3 text-foreground flex-shrink-0" />
                 )}
               </div>
             </div>
@@ -723,7 +747,7 @@ function FeaturedCard({
             size="sm"
             variant={isInstalled ? "outline" : "default"}
             className={cn(
-              "h-7 px-3 text-xs font-semibold rounded-full flex-shrink-0",
+              "h-7 px-3 text-xs font-semibold rounded-none uppercase tracking-wide flex-shrink-0",
               isInstalled && "pointer-events-none"
             )}
             disabled={installing || isInstalled}
@@ -735,9 +759,9 @@ function FeaturedCard({
             {installing ? (
               <Loader2 className="h-3 w-3 animate-spin" />
             ) : isInstalled ? (
-              "Installed"
+              "INSTALLED"
             ) : (
-              "Get"
+              "GET"
             )}
           </Button>
         </div>
@@ -747,7 +771,7 @@ function FeaturedCard({
         </p>
 
         <div className="flex items-center justify-between">
-          <Badge variant="secondary" className="text-[10px] px-2 py-0.5 font-normal rounded-full">
+          <Badge variant="secondary" className="text-[10px] px-2 py-0.5 font-normal rounded-none">
             {pipe.category}
           </Badge>
           <div className="flex items-center gap-3 text-xs text-muted-foreground">
@@ -787,10 +811,10 @@ function PipeCard({
   return (
     <div
       onClick={onClick}
-      className="border border-border bg-card hover:bg-accent/50 transition-all duration-200 rounded-xl p-5 cursor-pointer group"
+      className="border border-border bg-card hover:bg-accent/50 transition-colors duration-150 rounded-none p-5 cursor-pointer group"
     >
       <div className="flex items-start gap-3">
-        <div className="text-2xl bg-muted rounded-xl h-11 w-11 flex items-center justify-center flex-shrink-0">
+        <div className="text-2xl bg-muted rounded-none h-11 w-11 flex items-center justify-center flex-shrink-0">
           {pipe.icon || "🔧"}
         </div>
         <div className="min-w-0 flex-1">
@@ -800,7 +824,7 @@ function PipeCard({
               <div className="flex items-center gap-1 text-xs text-muted-foreground mt-0.5">
                 <span className="truncate">{pipe.author}</span>
                 {pipe.author_verified && (
-                  <BadgeCheck className="h-3 w-3 text-blue-500 flex-shrink-0" />
+                  <BadgeCheck className="h-3 w-3 text-foreground flex-shrink-0" />
                 )}
               </div>
             </div>
@@ -808,7 +832,7 @@ function PipeCard({
               size="sm"
               variant={isInstalled ? "outline" : "default"}
               className={cn(
-                "h-7 px-3 text-xs font-semibold rounded-full flex-shrink-0",
+                "h-7 px-3 text-xs font-semibold rounded-none uppercase tracking-wide flex-shrink-0",
                 isInstalled && "pointer-events-none"
               )}
               disabled={installing || isInstalled}
@@ -820,9 +844,9 @@ function PipeCard({
               {installing ? (
                 <Loader2 className="h-3 w-3 animate-spin" />
               ) : isInstalled ? (
-                "Installed"
+                "INSTALLED"
               ) : (
-                "Get"
+                "GET"
               )}
             </Button>
           </div>
@@ -839,14 +863,14 @@ function PipeCard({
             <Badge
               key={p.key}
               variant="outline"
-              className="text-[10px] px-1.5 py-0 gap-0.5 font-normal rounded-full"
+              className="text-[10px] px-1.5 py-0 gap-0.5 font-normal rounded-none"
             >
               {p.icon}
               {p.label}
             </Badge>
           ))}
           {permissionPills.length > 3 && (
-            <Badge variant="outline" className="text-[10px] px-1.5 py-0 font-normal rounded-full">
+            <Badge variant="outline" className="text-[10px] px-1.5 py-0 font-normal rounded-none">
               +{permissionPills.length - 3}
             </Badge>
           )}
@@ -938,7 +962,7 @@ function PipeDetailPanel({
                   <div className="flex items-center gap-1 text-sm text-muted-foreground">
                     <span>{pipe.author}</span>
                     {pipe.author_verified && (
-                      <BadgeCheck className="h-3.5 w-3.5 text-blue-500" />
+                      <BadgeCheck className="h-3.5 w-3.5 text-foreground" />
                     )}
                   </div>
                 ) : null}
@@ -980,17 +1004,17 @@ function PipeDetailPanel({
                 <Button
                   size="sm"
                   variant="destructive"
-                  className="h-9 px-4 text-sm font-semibold rounded-none"
+                  className="h-9 px-4 text-sm font-semibold rounded-none uppercase tracking-wide"
                   disabled={unpublishing}
                   onClick={() => onUnpublish(pipe.slug)}
                 >
                   {unpublishing ? (
                     <>
                       <Loader2 className="h-4 w-4 animate-spin mr-1.5" />
-                      unpublishing...
+                      UNPUBLISHING...
                     </>
                   ) : (
-                    "unpublish"
+                    "UNPUBLISH"
                   )}
                 </Button>
               )}
@@ -998,7 +1022,7 @@ function PipeDetailPanel({
                 size="sm"
                 variant={isInstalled ? "outline" : "default"}
                 className={cn(
-                  "h-9 px-5 text-sm font-semibold rounded-none flex-shrink-0",
+                  "h-9 px-5 text-sm font-semibold rounded-none uppercase tracking-wide flex-shrink-0",
                   isInstalled && "pointer-events-none"
                 )}
                 disabled={
@@ -1009,14 +1033,14 @@ function PipeDetailPanel({
                 {installing === pipe.slug ? (
                   <>
                     <Loader2 className="h-4 w-4 animate-spin mr-1.5" />
-                    installing...
+                    INSTALLING...
                   </>
                 ) : isInstalled ? (
-                  "Installed"
+                  "INSTALLED"
                 ) : (
                   <>
                     <Download className="h-4 w-4 mr-1.5" />
-                    Get
+                    GET
                   </>
                 )}
               </Button>
@@ -1049,11 +1073,11 @@ function PipeDetailPanel({
                 code: ({ className, children, ...props }) => {
                   const isInline = !className;
                   return isInline ? (
-                    <code className="bg-muted px-1.5 py-0.5 rounded text-xs" {...props}>
+                    <code className="bg-muted text-foreground px-1.5 py-0.5 rounded-none text-xs" {...props}>
                       {children}
                     </code>
                   ) : (
-                    <pre className="bg-muted p-4 rounded-lg overflow-x-auto text-xs">
+                    <pre className="bg-muted text-foreground p-4 rounded-none overflow-x-auto text-xs">
                       <code className={className} {...props}>
                         {children}
                       </code>
@@ -1085,9 +1109,9 @@ function PipeDetailPanel({
                   className="flex items-center gap-2 text-sm py-1.5"
                 >
                   {status === "allowed" ? (
-                    <CheckCircle2 className="h-4 w-4 text-green-500 flex-shrink-0" />
+                    <CheckCircle2 className="h-4 w-4 text-foreground flex-shrink-0" />
                   ) : status === "denied" ? (
-                    <XCircle className="h-4 w-4 text-red-500 flex-shrink-0" />
+                    <XCircle className="h-4 w-4 text-muted-foreground flex-shrink-0" />
                   ) : (
                     <div className="h-4 w-4 rounded-full border-2 border-muted-foreground/30 flex-shrink-0" />
                   )}
@@ -1116,8 +1140,8 @@ function PipeDetailPanel({
 
         {/* Unrestricted warning */}
         {unrestricted && (
-          <div className="border border-orange-500/50 bg-orange-500/5 rounded-none p-4 space-y-2">
-            <div className="flex items-center gap-2 text-sm font-medium text-orange-600 dark:text-orange-400">
+          <div className="border border-foreground bg-muted/50 rounded-none p-4 space-y-2">
+            <div className="flex items-center gap-2 text-sm font-medium text-foreground">
               <AlertTriangle className="h-4 w-4" />
               unrestricted data access
             </div>
@@ -1210,10 +1234,10 @@ function PipeDetailPanel({
                     {submittingReview ? (
                       <>
                         <Loader2 className="h-3 w-3 animate-spin mr-1.5" />
-                        submitting...
+                        SUBMITTING...
                       </>
                     ) : (
-                      "submit review"
+                      "SUBMIT REVIEW"
                     )}
                   </Button>
                 </div>
@@ -1254,6 +1278,32 @@ function PipeDetailPanel({
 
 // --- Publish Dialog ---
 
+// Redact secrets from pipe content before publishing
+function redactSecrets(text: string): { redacted: string; count: number } {
+  let count = 0;
+  const patterns: [RegExp, string][] = [
+    [/sk-ant-[a-zA-Z0-9_-]{20,}/g, "sk-ant-***REDACTED***"],
+    [/sk-[a-zA-Z0-9]{20,}/g, "sk-***REDACTED***"],
+    [/ghp_[a-zA-Z0-9]{36,}/g, "ghp_***REDACTED***"],
+    [/gho_[a-zA-Z0-9]{36,}/g, "gho_***REDACTED***"],
+    [/xoxb-[a-zA-Z0-9-]+/g, "xoxb-***REDACTED***"],
+    [/xoxp-[a-zA-Z0-9-]+/g, "xoxp-***REDACTED***"],
+    [/AIza[a-zA-Z0-9_-]{30,}/g, "AIza***REDACTED***"],
+    [/AKIA[A-Z0-9]{16,}/g, "AKIA***REDACTED***"],
+    [/Bearer\s+ey[a-zA-Z0-9._-]+/g, "Bearer ***REDACTED***"],
+    [/((?:API_KEY|SECRET|TOKEN|PASSWORD|CREDENTIALS)\s*[=:]\s*["']?)([a-zA-Z0-9_-]{8,})(["']?)/gi,
+      "$1***REDACTED***$3"],
+  ];
+  let result = text;
+  for (const [pattern, replacement] of patterns) {
+    const before = result;
+    result = result.replace(pattern, replacement);
+    if (result !== before) count++;
+    pattern.lastIndex = 0;
+  }
+  return { redacted: result, count };
+}
+
 function PublishDialog({
   open,
   onOpenChange,
@@ -1274,6 +1324,7 @@ function PublishDialog({
   const [icon, setIcon] = useState("🔧");
   const [publishCategory, setPublishCategory] = useState("Other");
   const [publishing, setPublishing] = useState(false);
+  const [redactEnabled, setRedactEnabled] = useState(true);
 
   useEffect(() => {
     if (!open) return;
@@ -1294,8 +1345,17 @@ function PublishDialog({
     try {
       // Get pipe content from local pipes list
       const pipe = localPipes.find((p: any) => p.name === selectedPipe);
-      const sourceMd = pipe?.raw_content;
+      let sourceMd = pipe?.raw_content as string | undefined;
       if (!sourceMd) throw new Error("could not read pipe content");
+
+      // Redact secrets if enabled
+      if (redactEnabled) {
+        const { redacted, count } = redactSecrets(sourceMd);
+        if (count > 0) {
+          sourceMd = redacted;
+          toast({ title: `redacted ${count} secret(s) from pipe before publishing` });
+        }
+      }
 
       const headers: Record<string, string> = {
         "Content-Type": "application/json",
@@ -1421,6 +1481,18 @@ function PublishDialog({
                 </Select>
               </div>
             </div>
+
+            {/* Redact secrets checkbox */}
+            <div className="flex items-center gap-2 pt-1">
+              <Checkbox
+                id="redact-secrets"
+                checked={redactEnabled}
+                onCheckedChange={(v) => setRedactEnabled(v === true)}
+              />
+              <Label htmlFor="redact-secrets" className="text-xs text-muted-foreground">
+                redact API keys & secrets before publishing
+              </Label>
+            </div>
           </div>
         )}
 
@@ -1431,7 +1503,7 @@ function PublishDialog({
             onClick={() => onOpenChange(false)}
             className="text-xs"
           >
-            cancel
+            CANCEL
           </Button>
           {token && (
             <Button
@@ -1443,10 +1515,10 @@ function PublishDialog({
               {publishing ? (
                 <>
                   <Loader2 className="h-3 w-3 animate-spin mr-1" />
-                  publishing...
+                  PUBLISHING...
                 </>
               ) : (
-                "publish"
+                "PUBLISH"
               )}
             </Button>
           )}
@@ -1469,7 +1541,7 @@ export function PermissionsReview({
 
   return (
     <div className="space-y-3">
-      <div className="border border-border rounded-xl p-4 space-y-2">
+      <div className="border border-border rounded-none p-4 space-y-2">
         <div className="flex items-center gap-1.5 text-sm font-medium">
           <Shield className="h-4 w-4" />
           data access
@@ -1483,9 +1555,9 @@ export function PermissionsReview({
                 className="flex items-center gap-2 text-xs py-1"
               >
                 {status === "allowed" ? (
-                  <CheckCircle2 className="h-3.5 w-3.5 text-green-500 flex-shrink-0" />
+                  <CheckCircle2 className="h-3.5 w-3.5 text-foreground flex-shrink-0" />
                 ) : status === "denied" ? (
-                  <XCircle className="h-3.5 w-3.5 text-red-500 flex-shrink-0" />
+                  <XCircle className="h-3.5 w-3.5 text-muted-foreground flex-shrink-0" />
                 ) : (
                   <div className="h-3.5 w-3.5 rounded-full border border-muted-foreground/30 flex-shrink-0" />
                 )}
@@ -1500,8 +1572,8 @@ export function PermissionsReview({
       </div>
 
       {unrestricted && (
-        <div className="border border-orange-500/50 bg-orange-500/5 rounded-xl p-4">
-          <div className="flex items-center gap-2 text-xs font-medium text-orange-600 dark:text-orange-400">
+        <div className="border border-foreground bg-muted/50 rounded-none p-4">
+          <div className="flex items-center gap-2 text-xs font-medium text-foreground">
             <AlertTriangle className="h-3.5 w-3.5" />
             unrestricted data access — this pipe can read all your data
           </div>

@@ -69,6 +69,7 @@ impl ShortcutConfig {
             dictation: store.dictation_shortcut,
             disabled: store.disabled_shortcuts,
         })
+    }
 
     fn is_disabled(&self, shortcut_type: &str) -> bool {
         let frontend_key = match shortcut_type {
@@ -136,6 +137,7 @@ pub async fn update_global_shortcuts(
         show_chat: store_config.show_chat,
         search: store_config.search,
         lock_vault: store_config.lock_vault,
+        dictation: store_config.dictation,
         disabled: store_config.disabled,
     };
     apply_shortcuts(&app, &config).await

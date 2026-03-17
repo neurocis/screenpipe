@@ -105,9 +105,18 @@ pub async fn get_frame_data(
                 // Synced frame from another device — no local file exists.
                 // Return metadata (OCR text, app/window context) instead of 410.
                 if file_path.starts_with("cloud://") {
-                    let ocr_text = state.db.get_frame_ocr_text_json(frame_id).await.ok().flatten();
+                    let ocr_text = state
+                        .db
+                        .get_frame_ocr_text_json(frame_id)
+                        .await
+                        .ok()
+                        .flatten();
                     let timestamp = state.db.get_frame_timestamp(frame_id).await.ok().flatten();
-                    let (acc_text, _) = state.db.get_frame_accessibility_data(frame_id).await.unwrap_or((None, None));
+                    let (acc_text, _) = state
+                        .db
+                        .get_frame_accessibility_data(frame_id)
+                        .await
+                        .unwrap_or((None, None));
 
                     let metadata = json!({
                         "error": "Frame is on a remote device",
@@ -117,10 +126,7 @@ pub async fn get_frame_data(
                         "ocr_text": ocr_text,
                         "accessibility_text": acc_text,
                     });
-                    return Err((
-                        StatusCode::NOT_FOUND,
-                        JsonResponse(metadata),
-                    ));
+                    return Err((StatusCode::NOT_FOUND, JsonResponse(metadata)));
                 }
 
                 if is_snapshot {
@@ -486,6 +492,9 @@ pub struct AccessibilityNode {
     pub depth: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bounds: Option<AccessibilityNodeBounds>,
+    /// Automation properties (stable ID, class, state, etc.) — present for newer captures.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub properties: Option<serde_json::Value>,
 }
 
 /// Response type for frame context endpoint (accessibility-first, OCR fallback)
@@ -552,11 +561,30 @@ pub async fn get_frame_context(
                             })
                         });
 
+                        // Collect automation properties if present
+                        let properties = {
+                            let mut props = serde_json::Map::new();
+                            for key in &[
+                                "automation_id", "class_name", "value", "help_text",
+                                "url", "placeholder", "role_description", "subrole",
+                                "is_enabled", "is_focused", "is_selected", "is_expanded",
+                                "is_password", "is_keyboard_focusable", "accelerator_key", "access_key",
+                            ] {
+                                if let Some(v) = node_val.get(*key) {
+                                    if !v.is_null() {
+                                        props.insert((*key).to_string(), v.clone());
+                                    }
+                                }
+                            }
+                            if props.is_empty() { None } else { Some(serde_json::Value::Object(props)) }
+                        };
+
                         nodes.push(AccessibilityNode {
                             role: role.clone(),
                             text: text.clone(),
                             depth,
                             bounds,
+                            properties,
                         });
 
                         // Extract URLs from link roles

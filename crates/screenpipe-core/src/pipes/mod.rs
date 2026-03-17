@@ -11,6 +11,7 @@
 //! [`AgentExecutor`].
 
 pub mod permissions;
+pub mod preset_fallback;
 pub mod sync;
 
 use crate::agents::{
@@ -57,10 +58,16 @@ pub struct PipeConfig {
     /// LLM provider override.  Default: none (uses screenpipe cloud).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider: Option<String>,
-    /// AI preset id from `~/.screenpipe/store.bin` → `settings.aiPresets`.
+    /// AI preset id(s) from `~/.screenpipe/store.bin` → `settings.aiPresets`.
     /// When set, overrides `model` and `provider` at runtime.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub preset: Option<String>,
+    /// Accepts a single string or an array of strings for fallback.
+    /// Example: `preset: "my-preset"` or `preset: ["primary", "fallback"]`
+    #[serde(
+        default,
+        deserialize_with = "deserialize_preset_field",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub preset: Vec<String>,
 
     // -- Data permissions (all optional, backwards compatible) ---------------
     /// Only data from these apps reaches the pipe (case-insensitive).
@@ -119,9 +126,60 @@ pub struct PipeConfig {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub connections: Vec<String>,
 
+    /// Execution timeout in seconds. Default: 300 (5 minutes).
+    /// Set higher for long-running pipes (e.g. coding agents): `timeout: 2400`
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout: Option<u64>,
+
     /// Catches any extra fields from front-matter (backwards compat).
     #[serde(default, flatten, skip_serializing_if = "HashMap::is_empty")]
     pub config: HashMap<String, serde_json::Value>,
+}
+
+/// Deserialize `preset` field: accepts a single string or an array of strings.
+fn deserialize_preset_field<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de;
+
+    struct PresetVisitor;
+
+    impl<'de> de::Visitor<'de> for PresetVisitor {
+        type Value = Vec<String>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+            formatter.write_str("a string or array of strings")
+        }
+
+        fn visit_str<E: de::Error>(self, v: &str) -> Result<Vec<String>, E> {
+            if v.is_empty() {
+                Ok(vec![])
+            } else {
+                Ok(vec![v.to_string()])
+            }
+        }
+
+        fn visit_none<E: de::Error>(self) -> Result<Vec<String>, E> {
+            Ok(vec![])
+        }
+
+        fn visit_unit<E: de::Error>(self) -> Result<Vec<String>, E> {
+            Ok(vec![])
+        }
+
+        fn visit_seq<A: de::SeqAccess<'de>>(self, mut seq: A) -> Result<Vec<String>, A::Error> {
+            let mut result = Vec::new();
+            while let Some(s) = seq.next_element::<String>()? {
+                if !s.is_empty() {
+                    result.push(s);
+                }
+            }
+            Ok(result)
+        }
+    }
+
+    deserializer.deserialize_any(PresetVisitor)
 }
 
 fn default_schedule() -> String {
@@ -556,6 +614,8 @@ pub struct PipeManager {
     token_registry: Option<Arc<dyn permissions::PipeTokenRegistry>>,
     /// Extra context appended to every pipe prompt (e.g. connected integrations).
     extra_context: Option<String>,
+    /// Circuit breaker registry for AI preset fallback.
+    fallback_registry: Arc<preset_fallback::PresetFallbackRegistry>,
 }
 
 impl PipeManager {
@@ -565,6 +625,11 @@ impl PipeManager {
         store: Option<Arc<dyn PipeStore>>,
         api_port: u16,
     ) -> Self {
+        // Initialize fallback registry from the screenpipe data dir
+        let screenpipe_dir = pipes_dir.parent().unwrap_or(&pipes_dir);
+        let registry = Arc::new(preset_fallback::PresetFallbackRegistry::new(screenpipe_dir));
+        registry.recover_on_startup();
+
         Self {
             pipes_dir,
             executors,
@@ -582,6 +647,7 @@ impl PipeManager {
             )),
             token_registry: None,
             extra_context: None,
+            fallback_registry: registry,
         }
     }
 
@@ -952,7 +1018,7 @@ impl PipeManager {
 
         // Resolve preset
         let (run_model, run_provider, run_provider_url, run_api_key, preset_prompt) =
-            if let Some(ref preset_id) = config.preset {
+            if let Some(preset_id) = config.preset.first() {
                 match resolve_preset(&self.pipes_dir, preset_id) {
                     Some(resolved) => (
                         resolved.model,
@@ -1066,11 +1132,12 @@ impl PipeManager {
         let pipes_dir_for_log = self.pipes_dir.clone();
         let executors = self.executors.clone();
         let agent = config.agent.clone();
+        let pipe_timeout = config.timeout.unwrap_or(DEFAULT_TIMEOUT_SECS);
 
         // Spawn the actual execution in a background task
         tokio::spawn(async move {
             let started_at = Utc::now();
-            let timeout_duration = std::time::Duration::from_secs(DEFAULT_TIMEOUT_SECS);
+            let timeout_duration = std::time::Duration::from_secs(pipe_timeout);
 
             // Create streaming channel and drainer task
             let (line_tx, mut line_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
@@ -1213,7 +1280,7 @@ impl PipeManager {
                                 Some("timeout"),
                                 Some(&format!(
                                     "execution timed out after {}s",
-                                    DEFAULT_TIMEOUT_SECS
+                                    pipe_timeout
                                 )),
                             )
                             .await;
@@ -1228,7 +1295,7 @@ impl PipeManager {
                             finished_at,
                             success: false,
                             stdout: String::new(),
-                            stderr: format!("execution timed out after {}s", DEFAULT_TIMEOUT_SECS),
+                            stderr: format!("execution timed out after {}s", pipe_timeout),
                         },
                         Some("timeout".to_string()),
                     )
@@ -1248,7 +1315,10 @@ impl PipeManager {
             if cb_error_type.as_deref() == Some("context_overflow") {
                 let pipe_dir = pipes_dir_for_log.join(&pipe_name);
                 if let Err(e) = delete_pi_sessions(&pipe_dir) {
-                    warn!("failed to clear Pi session after context overflow for '{}': {}", pipe_name, e);
+                    warn!(
+                        "failed to clear Pi session after context overflow for '{}': {}",
+                        pipe_name, e
+                    );
                 } else {
                     info!("cleared Pi session for '{}' after context overflow — next run starts fresh", pipe_name);
                 }
@@ -1286,6 +1356,12 @@ impl PipeManager {
 
     /// Run a pipe once with an explicit trigger type.
     async fn run_pipe_with_trigger(&self, name: &str, trigger: &str) -> Result<PipeRunLog> {
+        self.run_pipe_with_trigger_inner(name, trigger, 0).await
+    }
+
+    /// Inner implementation with retry depth tracking for preset fallback.
+    fn run_pipe_with_trigger_inner<'a>(&'a self, name: &'a str, trigger: &'a str, retry_depth: usize) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<PipeRunLog>> + Send + 'a>> {
+        Box::pin(async move {
         let (config, body, _raw) = {
             let pipes = self.pipes.lock().await;
             pipes
@@ -1321,43 +1397,65 @@ impl PipeManager {
         let started_at = Utc::now();
         let pipe_dir = self.pipes_dir.join(name);
 
-        // Resolve preset → model/provider overrides
-        let (run_model, run_provider, run_provider_url, run_api_key, preset_prompt) =
-            if let Some(ref preset_id) = config.preset {
-                match resolve_preset(&self.pipes_dir, preset_id) {
-                    Some(resolved) => {
-                        info!(
-                            "pipe '{}': using preset '{}' → model={}, provider={:?}",
-                            name, preset_id, resolved.model, resolved.provider
-                        );
-                        (
-                            resolved.model,
-                            resolved.provider,
-                            resolved.url,
-                            resolved.api_key,
-                            resolved.prompt,
-                        )
-                    }
-                    None => {
-                        return Err(anyhow!(
-                            "pipe '{}': preset '{}' not found in settings — \
+        // Resolve preset → model/provider overrides (with fallback support)
+        let (
+            run_model,
+            run_provider,
+            run_provider_url,
+            run_api_key,
+            preset_prompt,
+            active_preset_id,
+        ) = if !config.preset.is_empty() {
+            // Pick the best available preset using circuit breaker
+            let (preset_id, _idx) = self
+                .fallback_registry
+                .pick_preset(&config.preset)
+                .ok_or_else(|| anyhow!("pipe '{}': no presets configured", name))?;
+
+            match resolve_preset(&self.pipes_dir, preset_id) {
+                Some(resolved) => {
+                    info!(
+                        "pipe '{}': using preset '{}' → model={}, provider={:?}{}",
+                        name,
+                        preset_id,
+                        resolved.model,
+                        resolved.provider,
+                        if _idx > 0 {
+                            format!(" (fallback #{})", _idx)
+                        } else {
+                            String::new()
+                        }
+                    );
+                    (
+                        resolved.model,
+                        resolved.provider,
+                        resolved.url,
+                        resolved.api_key,
+                        resolved.prompt,
+                        Some(preset_id.to_string()),
+                    )
+                }
+                None => {
+                    return Err(anyhow!(
+                        "pipe '{}': preset '{}' not found in settings — \
                              create the preset in Settings → AI or remove the \
                              'preset: {}' line from the pipe config",
-                            name,
-                            preset_id,
-                            preset_id
-                        ));
-                    }
+                        name,
+                        preset_id,
+                        preset_id
+                    ));
                 }
-            } else {
-                (
-                    config.model.clone(),
-                    config.provider.clone(),
-                    None,
-                    None,
-                    None,
-                )
-            };
+            }
+        } else {
+            (
+                config.model.clone(),
+                config.provider.clone(),
+                None,
+                None,
+                None,
+                None,
+            )
+        };
 
         // Create DB execution row
         let exec_id = if let Some(ref store) = self.store {
@@ -1442,7 +1540,8 @@ impl PipeManager {
         }
 
         // Run with timeout + streaming
-        let timeout_duration = std::time::Duration::from_secs(DEFAULT_TIMEOUT_SECS);
+        let pipe_timeout = config.timeout.unwrap_or(DEFAULT_TIMEOUT_SECS);
+        let timeout_duration = std::time::Duration::from_secs(pipe_timeout);
 
         let (line_tx, mut line_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
         let drain_pipe_name = name.to_string();
@@ -1521,6 +1620,20 @@ impl PipeManager {
                     let _ = store.upsert_scheduler_state(name, output.success).await;
                 }
 
+                // Update circuit breaker state
+                if let Some(ref pid) = active_preset_id {
+                    if output.success {
+                        self.fallback_registry.record_success(pid);
+                    } else if config.preset.len() > 1 {
+                        // Only record failure for fallback if multiple presets configured
+                        self.fallback_registry.record_failure_from_output(
+                            pid,
+                            &output.stderr,
+                            &filtered_stdout,
+                        );
+                    }
+                }
+
                 PipeRunLog {
                     pipe_name: name.to_string(),
                     started_at,
@@ -1562,7 +1675,7 @@ impl PipeManager {
                 // Timeout — kill the process
                 warn!(
                     "pipe '{}' timed out after {}s, killing process",
-                    name, DEFAULT_TIMEOUT_SECS
+                    name, pipe_timeout
                 );
                 if let Some(handle) = removed_handle {
                     if handle.pid != 0 {
@@ -1583,7 +1696,7 @@ impl PipeManager {
                             Some("timeout"),
                             Some(&format!(
                                 "execution timed out after {}s",
-                                DEFAULT_TIMEOUT_SECS
+                                pipe_timeout
                             )),
                         )
                         .await;
@@ -1598,7 +1711,7 @@ impl PipeManager {
                     finished_at,
                     success: false,
                     stdout: String::new(),
-                    stderr: format!("execution timed out after {}s", DEFAULT_TIMEOUT_SECS),
+                    stderr: format!("execution timed out after {}s", pipe_timeout),
                 }
             }
         };
@@ -1608,11 +1721,36 @@ impl PipeManager {
             cleanup_pipe_token(token, self.token_registry.as_ref());
         }
 
+        // Immediate fallback retry: if the pipe failed with a retryable error
+        // and there are fallback presets available, retry now instead of waiting
+        // for the next scheduled run.
+        if !log.success && config.preset.len() > 1 && retry_depth < config.preset.len() - 1 {
+            // Check if the circuit breaker picked a different preset for retry
+            if let Some((next_preset_id, _)) = self.fallback_registry.pick_preset(&config.preset) {
+                let should_retry = match &active_preset_id {
+                    Some(current_id) => next_preset_id != current_id.as_str(),
+                    None => false,
+                };
+                if should_retry {
+                    info!(
+                        "pipe '{}': primary preset failed, immediately retrying with fallback '{}'",
+                        name, next_preset_id
+                    );
+                    // Save log of the failed attempt
+                    self.append_log(name, &log).await;
+                    let _ = self.write_log_to_disk(name, &log);
+                    // Retry with next preset
+                    return self.run_pipe_with_trigger_inner(name, trigger, retry_depth + 1).await;
+                }
+            }
+        }
+
         // Save log (in-memory + disk)
         self.append_log(name, &log).await;
         let _ = self.write_log_to_disk(name, &log);
 
         Ok(log)
+        }) // end Box::pin(async move { ... })
     }
 
     /// Enable or disable a pipe (writes back to pipe.md front-matter).
@@ -1710,11 +1848,7 @@ impl PipeManager {
                     }
                 }
                 "preset" => {
-                    if v.is_null() || v.as_str() == Some("") {
-                        config.preset = None;
-                    } else if let Some(s) = v.as_str() {
-                        config.preset = Some(s.to_string());
-                    }
+                    config.preset = preset_fallback::parse_preset_list(v);
                 }
                 "connections" => {
                     if let Some(arr) = v.as_array() {
@@ -1994,9 +2128,9 @@ impl PipeManager {
 
                     // Resolve preset → model/provider overrides (same as run_pipe)
                     let (model, provider, provider_url, api_key, preset_prompt) = if let Some(
-                        ref preset_id,
+                        preset_id,
                     ) =
-                        config.preset
+                        config.preset.first()
                     {
                         match resolve_preset(&pipes_dir, preset_id) {
                             Some(resolved) => {
@@ -2074,6 +2208,7 @@ impl PipeManager {
                     let on_output = on_output_line.clone();
                     let store_ref = store.clone();
                     let token_registry_ref = token_registry.clone();
+                    let pipe_timeout = config.timeout.unwrap_or(DEFAULT_TIMEOUT_SECS);
 
                     tokio::spawn(async move {
                         // Create DB execution row
@@ -2131,7 +2266,7 @@ impl PipeManager {
                         });
 
                         let started_at = Utc::now();
-                        let timeout_duration = std::time::Duration::from_secs(DEFAULT_TIMEOUT_SECS);
+                        let timeout_duration = std::time::Duration::from_secs(pipe_timeout);
 
                         // Create streaming channel and drainer for scheduler
                         let (line_tx, mut line_rx) =
@@ -2266,7 +2401,7 @@ impl PipeManager {
                             Err(_elapsed) => {
                                 warn!(
                                     "pipe '{}' timed out after {}s",
-                                    pipe_name, DEFAULT_TIMEOUT_SECS
+                                    pipe_name, pipe_timeout
                                 );
                                 if let Some(handle) = removed_handle {
                                     if handle.pid != 0 {
@@ -2284,7 +2419,7 @@ impl PipeManager {
                                             Some("timeout"),
                                             Some(&format!(
                                                 "execution timed out after {}s",
-                                                DEFAULT_TIMEOUT_SECS
+                                                pipe_timeout
                                             )),
                                         )
                                         .await;
@@ -2301,7 +2436,7 @@ impl PipeManager {
                                         stdout: String::new(),
                                         stderr: format!(
                                             "execution timed out after {}s",
-                                            DEFAULT_TIMEOUT_SECS
+                                            pipe_timeout
                                         ),
                                     },
                                     Some("timeout".to_string()),
@@ -2899,7 +3034,7 @@ mod tests {
             agent: "pi".to_string(),
             model: "claude-haiku-4-5".to_string(),
             provider: None,
-            preset: Some("default".to_string()),
+            preset: vec!["default".to_string()],
             allow_apps: vec![],
             deny_apps: vec![],
             allow_windows: vec![],
@@ -2917,7 +3052,7 @@ mod tests {
         let serialized = serialize_pipe(&config, body).unwrap();
         let (parsed, parsed_body) = parse_frontmatter(&serialized).unwrap();
         assert_eq!(parsed.schedule, "every 1h");
-        assert_eq!(parsed.preset, Some("default".to_string()));
+        assert_eq!(parsed.preset, vec!["default".to_string()]);
         assert_eq!(parsed_body, body);
         // Name should be empty after serialize (skip_serializing_if)
         assert!(parsed.name.is_empty());
@@ -2994,7 +3129,7 @@ mod tests {
             agent: "pi".to_string(),
             model: "test-model".to_string(),
             provider: None,
-            preset: None,
+            preset: vec![],
             allow_apps: vec![],
             deny_apps: vec![],
             allow_windows: vec![],
@@ -3023,7 +3158,7 @@ mod tests {
             agent: "pi".to_string(),
             model: "test-model".to_string(),
             provider: None,
-            preset: None,
+            preset: vec![],
             allow_apps: vec![],
             deny_apps: vec![],
             allow_windows: vec![],
@@ -3050,7 +3185,7 @@ mod tests {
             agent: "pi".to_string(),
             model: "test-model".to_string(),
             provider: None,
-            preset: None,
+            preset: vec![],
             allow_apps: vec![],
             deny_apps: vec![],
             allow_windows: vec![],
@@ -3085,7 +3220,7 @@ mod tests {
             agent: "pi".to_string(),
             model: "test-model".to_string(),
             provider: None,
-            preset: None,
+            preset: vec![],
             allow_apps: vec![],
             deny_apps: vec![],
             allow_windows: vec![],
@@ -3159,7 +3294,7 @@ mod tests {
                 agent: "pi".to_string(),
                 model: "test".to_string(),
                 provider: None,
-                preset: None,
+                preset: vec![],
                 allow_apps: vec![],
                 deny_apps: vec![],
                 allow_windows: vec![],

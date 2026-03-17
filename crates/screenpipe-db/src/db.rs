@@ -29,10 +29,10 @@ use futures::future::try_join_all;
 use crate::{
     text_similarity::is_similar_transcription, AudioChunksResponse, AudioDevice, AudioEntry,
     AudioResult, AudioResultRaw, ContentType, DeviceType, Element, ElementRow, ElementSource,
-    FrameData, FrameRow, FrameRowLight, FrameWindowData, InsertUiEvent, MeetingRecord, MemoryRecord, OCREntry,
-    OCRResult, OCRResultRaw, OcrEngine, OcrTextBlock, Order, SearchMatch, SearchMatchGroup,
-    SearchResult, Speaker, TagContentType, TextBounds, TextPosition, TimeSeriesChunk, UiContent,
-    UiEventRecord, UiEventRow, VideoMetadata,
+    FrameData, FrameRow, FrameRowLight, FrameWindowData, InsertUiEvent, MeetingRecord,
+    MemoryRecord, OCREntry, OCRResult, OCRResultRaw, OcrEngine, OcrTextBlock, Order, SearchMatch,
+    SearchMatchGroup, SearchResult, Speaker, TagContentType, TextBounds, TextPosition,
+    TimeSeriesChunk, UiContent, UiEventRecord, UiEventRow, VideoMetadata,
 };
 
 /// Time window (in seconds) to check for similar transcriptions across devices.
@@ -157,6 +157,9 @@ pub struct DatabaseManager {
     /// starving the pool for writes and fast reads. By capping at 2 concurrent
     /// heavy reads, we guarantee 25+ connections remain available for normal ops.
     heavy_read_semaphore: Arc<Semaphore>,
+    /// Write coalescing queue. Hot-path writes are submitted here and
+    /// batched into single transactions every 100ms.
+    write_queue: crate::write_queue::WriteQueue,
 }
 
 impl DatabaseManager {
@@ -221,11 +224,15 @@ impl DatabaseManager {
             .connect_with(connect_options)
             .await?;
 
+        let write_semaphore = Arc::new(Semaphore::new(1));
+        let write_queue =
+            crate::write_queue::spawn_write_drain(write_pool.clone(), Arc::clone(&write_semaphore));
         let db_manager = DatabaseManager {
             pool: read_pool,
             write_pool,
-            write_semaphore: Arc::new(Semaphore::new(1)),
+            write_semaphore,
             heavy_read_semaphore: Arc::new(Semaphore::new(2)),
+            write_queue,
         };
 
         // Checkpoint any stale WAL before running migrations or starting captures.
@@ -387,7 +394,8 @@ impl DatabaseManager {
         let mut last_error = None;
         for attempt in 1..=max_retries {
             let mut conn =
-                match tokio::time::timeout(Duration::from_secs(3), self.write_pool.acquire()).await {
+                match tokio::time::timeout(Duration::from_secs(3), self.write_pool.acquire()).await
+                {
                     Ok(Ok(conn)) => conn,
                     Ok(Err(e)) => return Err(e),
                     Err(_) => return Err(sqlx::Error::PoolTimedOut),
@@ -461,21 +469,59 @@ impl DatabaseManager {
         }
     }
 
+    /// Mark records as synced via the write coalescing queue.
+    /// This ensures sync UPDATEs go through the write semaphore and don't
+    /// bypass the write pool (which was causing WAL lock contention).
+    pub async fn mark_synced(
+        &self,
+        table: crate::write_queue::SyncTable,
+        synced_at: &str,
+        time_start: &str,
+        time_end: &str,
+    ) -> Result<(), sqlx::Error> {
+        use crate::write_queue::WriteOp;
+        self.write_queue
+            .submit(WriteOp::MarkSynced {
+                table,
+                synced_at: synced_at.to_string(),
+                time_start: time_start.to_string(),
+                time_end: time_end.to_string(),
+            })
+            .await?;
+        Ok(())
+    }
+
+    /// Compact snapshots via the write coalescing queue.
+    pub async fn compact_snapshots_queued(&self, chunk_id: i64, batch: Vec<(i64, u32)>) -> Result<(), sqlx::Error> {
+        use crate::write_queue::WriteOp;
+        self.write_queue.submit(WriteOp::CompactSnapshots { chunk_id, batch }).await?;
+        Ok(())
+    }
+
+    /// Delete audio chunks in batch via the write coalescing queue.
+    pub async fn delete_audio_chunks_batch_queued(&self, chunk_ids: Vec<i64>) -> Result<(), sqlx::Error> {
+        use crate::write_queue::WriteOp;
+        self.write_queue.submit(WriteOp::DeleteAudioChunksBatch { chunk_ids }).await?;
+        Ok(())
+    }
+
     pub async fn insert_audio_chunk(
         &self,
         file_path: &str,
         timestamp: Option<DateTime<Utc>>,
     ) -> Result<i64, sqlx::Error> {
-        let ts = timestamp.unwrap_or_else(Utc::now);
-        let mut tx = self.begin_immediate_with_retry().await?;
-        let id = sqlx::query("INSERT INTO audio_chunks (file_path, timestamp) VALUES (?1, ?2)")
-            .bind(file_path)
-            .bind(ts)
-            .execute(&mut **tx.conn())
-            .await?
-            .last_insert_rowid();
-        tx.commit().await?;
-        Ok(id)
+        use crate::write_queue::{WriteOp, WriteResult};
+        let result = self
+            .write_queue
+            .submit(WriteOp::InsertAudioChunk {
+                file_path: file_path.to_string(),
+                timestamp,
+            })
+            .await?;
+        match result {
+            WriteResult::Id(id) => Ok(id),
+            _ => unreachable!(),
+        }
     }
 
     async fn get_audio_chunk_id(&self, file_path: &str) -> Result<i64, sqlx::Error> {
@@ -538,12 +584,11 @@ impl DatabaseManager {
 
     /// Check whether an audio chunk row exists.
     pub async fn audio_chunk_exists(&self, chunk_id: i64) -> Result<bool, sqlx::Error> {
-        let exists: bool = sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM audio_chunks WHERE id = ?1)",
-        )
-        .bind(chunk_id)
-        .fetch_one(&self.pool)
-        .await?;
+        let exists: bool =
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM audio_chunks WHERE id = ?1)")
+                .bind(chunk_id)
+                .fetch_one(&self.pool)
+                .await?;
         Ok(exists)
     }
 
@@ -594,16 +639,15 @@ impl DatabaseManager {
         end_time: Option<f64>,
         timestamp: Option<DateTime<Utc>>,
     ) -> Result<i64, sqlx::Error> {
-        // Skip empty transcriptions
+        use crate::write_queue::{WriteOp, WriteResult};
+
+        // Skip empty transcriptions (no DB access needed)
         let trimmed = transcription.trim();
         if trimmed.is_empty() {
             return Ok(0);
         }
 
-        // CROSS-DEVICE DEDUPLICATION CHECK
-        // Check if similar transcription exists in the last N seconds from ANY device.
-        // This prevents the same audio content from being stored twice when captured
-        // by both system output and microphone.
+        // Pre-read phase: dedup check on read pool (no write lock)
         if self
             .has_similar_recent_transcription(trimmed, DEDUP_TIME_WINDOW_SECS)
             .await?
@@ -615,39 +659,25 @@ impl DatabaseManager {
             return Ok(0);
         }
 
-        let ts = timestamp.unwrap_or_else(Utc::now);
-        let text_length = transcription.len() as i64;
-        let mut tx = self.begin_immediate_with_retry().await?;
+        let result = self
+            .write_queue
+            .submit(WriteOp::InsertAudioTranscription {
+                audio_chunk_id,
+                transcription: trimmed.to_string(),
+                offset_index,
+                transcription_engine: transcription_engine.to_string(),
+                device_name: device.name.clone(),
+                is_input_device: device.device_type == DeviceType::Input,
+                speaker_id,
+                start_time,
+                end_time,
+                timestamp,
+            })
+            .await?;
 
-        // Insert the transcription, ignoring duplicates (same audio_chunk_id + transcription)
-        // This prevents duplicates from VAD segment overlap issues within the same device
-        let result = sqlx::query(
-            "INSERT OR IGNORE INTO audio_transcriptions (audio_chunk_id, transcription, offset_index, timestamp, transcription_engine, device, is_input_device, speaker_id, start_time, end_time, text_length) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-        )
-        .bind(audio_chunk_id)
-        .bind(transcription)
-        .bind(offset_index)
-        .bind(ts)
-        .bind(transcription_engine)
-        .bind(&device.name)
-        .bind(device.device_type == DeviceType::Input)
-        .bind(speaker_id)
-        .bind(start_time)
-        .bind(end_time)
-        .bind(text_length)
-        .execute(&mut **tx.conn())
-        .await?;
-
-        // Commit the transaction
-        tx.commit().await?;
-
-        // Returns 0 if the insert was ignored (duplicate), otherwise returns the new id
-        // Note: last_insert_rowid() returns the previous successful insert's id when ignored,
-        // so we check rows_affected() to detect ignored inserts
-        if result.rows_affected() == 0 {
-            Ok(0)
-        } else {
-            Ok(result.last_insert_rowid())
+        match result {
+            WriteResult::Id(id) => Ok(id),
+            _ => unreachable!(),
         }
     }
 
@@ -667,70 +697,48 @@ impl DatabaseManager {
         end_time: Option<f64>,
         timestamp: Option<DateTime<Utc>>,
     ) -> Result<i64, sqlx::Error> {
-        // Skip empty transcriptions early (no lock needed)
+        use crate::write_queue::{WriteOp, WriteResult};
+
         let trimmed = transcription.trim();
-        if trimmed.is_empty() {
-            // Still need to ensure the audio chunk exists
-            return self.get_or_insert_audio_chunk(file_path, timestamp).await;
-        }
 
-        // Read phase: no write lock needed
+        // Pre-read phase: runs on read pool, no write lock held
         let existing_chunk_id = self.get_audio_chunk_id(file_path).await?;
+        let is_duplicate = if !trimmed.is_empty() {
+            self.has_similar_recent_transcription(trimmed, DEDUP_TIME_WINDOW_SECS)
+                .await?
+        } else {
+            false
+        };
 
-        if self
-            .has_similar_recent_transcription(trimmed, DEDUP_TIME_WINDOW_SECS)
-            .await?
-        {
+        if is_duplicate {
             debug!(
                 "Skipping duplicate transcription (cross-device): {:?}",
                 &trimmed[..trimmed.len().min(50)]
             );
-            // Still return the chunk id
-            if existing_chunk_id != 0 {
-                return Ok(existing_chunk_id);
-            }
-            // Need to insert the chunk even if transcription is skipped
-            return self.insert_audio_chunk(file_path, timestamp).await;
         }
 
-        // Write phase: single transaction for both chunk + transcription
-        let ts = timestamp.unwrap_or_else(Utc::now);
-        let text_length = transcription.len() as i64;
-        let mut tx = self.begin_immediate_with_retry().await?;
+        let result = self
+            .write_queue
+            .submit(WriteOp::InsertAudioChunkAndTranscription {
+                file_path: file_path.to_string(),
+                transcription: transcription.to_string(),
+                offset_index,
+                transcription_engine: transcription_engine.to_string(),
+                device_name: device.name.clone(),
+                is_input_device: device.device_type == DeviceType::Input,
+                speaker_id,
+                start_time,
+                end_time,
+                timestamp,
+                existing_chunk_id,
+                is_duplicate,
+            })
+            .await?;
 
-        // Insert audio chunk if it doesn't exist yet
-        let audio_chunk_id = if existing_chunk_id != 0 {
-            existing_chunk_id
-        } else {
-            sqlx::query("INSERT INTO audio_chunks (file_path, timestamp) VALUES (?1, ?2)")
-                .bind(file_path)
-                .bind(ts)
-                .execute(&mut **tx.conn())
-                .await?
-                .last_insert_rowid()
-        };
-
-        // Insert the transcription
-        sqlx::query(
-            "INSERT OR IGNORE INTO audio_transcriptions (audio_chunk_id, transcription, offset_index, timestamp, transcription_engine, device, is_input_device, speaker_id, start_time, end_time, text_length) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-        )
-        .bind(audio_chunk_id)
-        .bind(transcription)
-        .bind(offset_index)
-        .bind(ts)
-        .bind(transcription_engine)
-        .bind(&device.name)
-        .bind(device.device_type == DeviceType::Input)
-        .bind(speaker_id)
-        .bind(start_time)
-        .bind(end_time)
-        .bind(text_length)
-        .execute(&mut **tx.conn())
-        .await?;
-
-        tx.commit().await?;
-
-        Ok(audio_chunk_id)
+        match result {
+            WriteResult::Id(id) => Ok(id),
+            _ => unreachable!(),
+        }
     }
 
     /// Check if a similar transcription exists in the recent time window.
@@ -1208,18 +1216,19 @@ impl DatabaseManager {
         device_name: &str,
         fps: f64,
     ) -> Result<i64, sqlx::Error> {
-        let mut tx = self.begin_immediate_with_retry().await?;
-        let id = sqlx::query(
-            "INSERT INTO video_chunks (file_path, device_name, fps) VALUES (?1, ?2, ?3)",
-        )
-        .bind(file_path)
-        .bind(device_name)
-        .bind(fps)
-        .execute(&mut **tx.conn())
-        .await?
-        .last_insert_rowid();
-        tx.commit().await?;
-        Ok(id)
+        use crate::write_queue::{WriteOp, WriteResult};
+        let result = self
+            .write_queue
+            .submit(WriteOp::InsertVideoChunkWithFps {
+                file_path: file_path.to_string(),
+                device_name: device_name.to_string(),
+                fps,
+            })
+            .await?;
+        match result {
+            WriteResult::Id(id) => Ok(id),
+            _ => unreachable!(),
+        }
     }
 
     /// Insert a frame record into the database.
@@ -1346,7 +1355,7 @@ impl DatabaseManager {
     ///
     /// Errors are logged and swallowed so that the primary OCR insert path is never
     /// blocked by a failure in the new elements table.
-    async fn insert_ocr_elements(
+    pub(crate) async fn insert_ocr_elements(
         tx: &mut sqlx::pool::PoolConnection<Sqlite>,
         frame_id: i64,
         text_json: &str,
@@ -1484,20 +1493,53 @@ impl DatabaseManager {
     /// used to resolve parent references.
     ///
     /// Errors are logged and swallowed.
-    async fn insert_accessibility_elements(
+    pub(crate) async fn insert_accessibility_elements(
         tx: &mut sqlx::pool::PoolConnection<Sqlite>,
         frame_id: i64,
         tree_json: &str,
     ) {
-        // AccessibilityTreeNode: { role, text, depth, bounds? }
-        #[derive(serde::Deserialize)]
+        // AccessibilityTreeNode: { role, text, depth, bounds?, automation props... }
+        #[derive(serde::Deserialize, serde::Serialize)]
         struct AxNode {
             role: String,
             text: String,
             depth: u8,
+            #[serde(skip_serializing_if = "Option::is_none")]
             bounds: Option<AxBounds>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            automation_id: Option<String>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            class_name: Option<String>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            value: Option<String>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            help_text: Option<String>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            url: Option<String>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            placeholder: Option<String>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            role_description: Option<String>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            subrole: Option<String>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            is_enabled: Option<bool>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            is_focused: Option<bool>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            is_selected: Option<bool>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            is_expanded: Option<bool>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            is_password: Option<bool>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            is_keyboard_focusable: Option<bool>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            accelerator_key: Option<String>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            access_key: Option<String>,
         }
-        #[derive(serde::Deserialize)]
+        #[derive(serde::Deserialize, serde::Serialize)]
         struct AxBounds {
             left: f32,
             top: f32,
@@ -1550,8 +1592,30 @@ impl DatabaseManager {
                 None => (None, None, None, None),
             };
 
+            // Serialize automation properties as JSON (only non-None fields)
+            let properties = {
+                let mut props = serde_json::Map::new();
+                if let Some(ref v) = node.automation_id { props.insert("automation_id".into(), serde_json::Value::String(v.clone())); }
+                if let Some(ref v) = node.class_name { props.insert("class_name".into(), serde_json::Value::String(v.clone())); }
+                if let Some(ref v) = node.value { props.insert("value".into(), serde_json::Value::String(v.clone())); }
+                if let Some(ref v) = node.help_text { props.insert("help_text".into(), serde_json::Value::String(v.clone())); }
+                if let Some(ref v) = node.url { props.insert("url".into(), serde_json::Value::String(v.clone())); }
+                if let Some(ref v) = node.placeholder { props.insert("placeholder".into(), serde_json::Value::String(v.clone())); }
+                if let Some(ref v) = node.role_description { props.insert("role_description".into(), serde_json::Value::String(v.clone())); }
+                if let Some(ref v) = node.subrole { props.insert("subrole".into(), serde_json::Value::String(v.clone())); }
+                if let Some(v) = node.is_enabled { props.insert("is_enabled".into(), serde_json::Value::Bool(v)); }
+                if let Some(v) = node.is_focused { props.insert("is_focused".into(), serde_json::Value::Bool(v)); }
+                if let Some(v) = node.is_selected { props.insert("is_selected".into(), serde_json::Value::Bool(v)); }
+                if let Some(v) = node.is_expanded { props.insert("is_expanded".into(), serde_json::Value::Bool(v)); }
+                if let Some(v) = node.is_password { props.insert("is_password".into(), serde_json::Value::Bool(v)); }
+                if let Some(v) = node.is_keyboard_focusable { props.insert("is_keyboard_focusable".into(), serde_json::Value::Bool(v)); }
+                if let Some(ref v) = node.accelerator_key { props.insert("accelerator_key".into(), serde_json::Value::String(v.clone())); }
+                if let Some(ref v) = node.access_key { props.insert("access_key".into(), serde_json::Value::String(v.clone())); }
+                if props.is_empty() { None } else { Some(serde_json::Value::Object(props).to_string()) }
+            };
+
             let result = sqlx::query_scalar::<_, i64>(
-                "INSERT INTO elements (frame_id, source, role, text, parent_id, depth, left_bound, top_bound, width_bound, height_bound, confidence, sort_order) VALUES (?1, 'accessibility', ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL, ?10) RETURNING id",
+                "INSERT INTO elements (frame_id, source, role, text, parent_id, depth, left_bound, top_bound, width_bound, height_bound, confidence, sort_order, properties) VALUES (?1, 'accessibility', ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL, ?10, ?11) RETURNING id",
             )
             .bind(frame_id)
             .bind(&node.role)
@@ -1563,6 +1627,7 @@ impl DatabaseManager {
             .bind(width)
             .bind(height)
             .bind(sort_order)
+            .bind(&properties)
             .fetch_one(&mut **tx)
             .await;
 
@@ -1603,9 +1668,9 @@ impl DatabaseManager {
         simhash: Option<i64>,
         ocr_data: Option<(&str, &str, &str)>, // (text, text_json, ocr_engine)
     ) -> Result<i64, sqlx::Error> {
-        // Compute full_text: the single searchable text blob for this frame.
-        // For hybrid frames, concatenate accessibility + OCR text.
-        // For single-source frames, use whichever text is available.
+        use crate::write_queue::{WriteOp, WriteResult};
+
+        // Compute full_text before submitting to queue (pure computation, no DB)
         let ocr_text_str = ocr_data.map(|(text, _, _)| text);
         let full_text = match text_source {
             Some("hybrid") => {
@@ -1621,83 +1686,39 @@ impl DatabaseManager {
                     Some(format!("{}\n{}", a11y, ocr))
                 }
             }
-            _ => {
-                // accessibility or ocr — use accessibility_text (already the best source)
-                // Fall back to OCR text if no accessibility
-                accessibility_text
-                    .filter(|t| !t.is_empty())
-                    .map(String::from)
-                    .or_else(|| ocr_text_str.filter(|t| !t.is_empty()).map(String::from))
-            }
+            _ => accessibility_text
+                .filter(|t| !t.is_empty())
+                .map(String::from)
+                .or_else(|| ocr_text_str.filter(|t| !t.is_empty()).map(String::from)),
         };
 
-        let mut tx = self.begin_immediate_with_retry().await?;
-
-        let id = sqlx::query(
-            r#"INSERT INTO frames (
-                video_chunk_id, offset_index, timestamp, name,
-                browser_url, app_name, window_name, focused, device_name,
-                snapshot_path, capture_trigger, accessibility_text, text_source,
-                accessibility_tree_json, content_hash, simhash, full_text
-            ) VALUES (
-                NULL, 0, ?1, ?2,
-                ?3, ?4, ?5, ?6, ?7,
-                ?8, ?9, ?10, ?11,
-                ?12, ?13, ?14, ?15
-            )"#,
-        )
-        .bind(timestamp)
-        .bind(snapshot_path) // name = snapshot_path for compatibility
-        .bind(browser_url)
-        .bind(app_name)
-        .bind(window_name)
-        .bind(focused)
-        .bind(device_name)
-        .bind(snapshot_path)
-        .bind(capture_trigger)
-        .bind(accessibility_text)
-        .bind(text_source)
-        .bind(accessibility_tree_json)
-        .bind(content_hash)
-        .bind(simhash)
-        .bind(&full_text)
-        .execute(&mut **tx.conn())
-        .await?
-        .last_insert_rowid();
-
-        // Insert OCR text positions in the same transaction (no extra connection needed)
-        if let Some((text, text_json, ocr_engine)) = ocr_data {
-            let text_length = text.len() as i64;
-            sqlx::query(
-                "INSERT INTO ocr_text (frame_id, text, text_json, ocr_engine, text_length) VALUES (?1, ?2, ?3, ?4, ?5)",
-            )
-            .bind(id)
-            .bind(text)
-            .bind(text_json)
-            .bind(ocr_engine)
-            .bind(text_length)
-            .execute(&mut **tx.conn())
+        let result = self
+            .write_queue
+            .submit(WriteOp::InsertSnapshotFrameWithOcr {
+                device_name: device_name.to_string(),
+                timestamp,
+                snapshot_path: snapshot_path.to_string(),
+                app_name: app_name.map(String::from),
+                window_name: window_name.map(String::from),
+                browser_url: browser_url.map(String::from),
+                focused,
+                capture_trigger: capture_trigger.map(String::from),
+                accessibility_text: accessibility_text.map(String::from),
+                text_source: text_source.map(String::from),
+                accessibility_tree_json: accessibility_tree_json.map(String::from),
+                content_hash,
+                simhash,
+                ocr_text: ocr_data.map(|(t, _, _)| t.to_string()),
+                ocr_text_json: ocr_data.map(|(_, j, _)| j.to_string()),
+                ocr_engine: ocr_data.map(|(_, _, e)| e.to_string()),
+                full_text,
+            })
             .await?;
 
-            // Dual-write: insert OCR elements into unified elements table
-            Self::insert_ocr_elements(tx.conn(), id, text_json).await;
+        match result {
+            WriteResult::Id(id) => Ok(id),
+            _ => unreachable!(),
         }
-
-        // Dual-write: insert accessibility elements if tree JSON is present
-        if let Some(tree_json) = accessibility_tree_json {
-            if !tree_json.is_empty() {
-                Self::insert_accessibility_elements(tx.conn(), id, tree_json).await;
-            }
-        }
-
-        tx.commit().await?;
-        debug!(
-            "insert_snapshot_frame: id={}, trigger={:?}, has_ocr={}",
-            id,
-            capture_trigger,
-            ocr_data.is_some()
-        );
-        Ok(id)
     }
 
     /// Get the next frame offset for a device.
@@ -1822,7 +1843,11 @@ impl DatabaseManager {
 
         for (idx, window) in windows.iter().enumerate() {
             // Compute full_text for FTS indexing
-            let full_text = if window.text.is_empty() { None } else { Some(window.text.as_str()) };
+            let full_text = if window.text.is_empty() {
+                None
+            } else {
+                Some(window.text.as_str())
+            };
 
             // Insert frame
             let frame_id = sqlx::query(
@@ -1941,7 +1966,11 @@ impl DatabaseManager {
 
             for (idx, window) in windows.iter().enumerate() {
                 // Compute full_text for FTS indexing
-                let full_text = if window.text.is_empty() { None } else { Some(window.text.as_str()) };
+                let full_text = if window.text.is_empty() {
+                    None
+                } else {
+                    Some(window.text.as_str())
+                };
 
                 let frame_id = sqlx::query(
                     "INSERT INTO frames (video_chunk_id, offset_index, timestamp, name, browser_url, app_name, window_name, focused, device_name, full_text) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
@@ -2208,14 +2237,18 @@ impl DatabaseManager {
                 SearchResult::Audio(audio) => audio.timestamp,
                 SearchResult::UI(ui) => ui.timestamp,
                 SearchResult::Input(input) => input.timestamp,
-                SearchResult::Memory(m) => m.created_at.parse::<DateTime<Utc>>().unwrap_or_default(),
+                SearchResult::Memory(m) => {
+                    m.created_at.parse::<DateTime<Utc>>().unwrap_or_default()
+                }
             };
             let timestamp_b = match b {
                 SearchResult::OCR(ocr) => ocr.timestamp,
                 SearchResult::Audio(audio) => audio.timestamp,
                 SearchResult::UI(ui) => ui.timestamp,
                 SearchResult::Input(input) => input.timestamp,
-                SearchResult::Memory(m) => m.created_at.parse::<DateTime<Utc>>().unwrap_or_default(),
+                SearchResult::Memory(m) => {
+                    m.created_at.parse::<DateTime<Utc>>().unwrap_or_default()
+                }
             };
             timestamp_b.cmp(&timestamp_a)
         });
@@ -2777,8 +2810,7 @@ impl DatabaseManager {
                     speaker_name,
                 ));
 
-                let (frames_count, audio_count) =
-                    tokio::try_join!(frames_future, audio_future)?;
+                let (frames_count, audio_count) = tokio::try_join!(frames_future, audio_future)?;
                 return Ok(frames_count + audio_count);
             } else {
                 let frames_count = frames_future.await?;
@@ -2955,11 +2987,7 @@ impl DatabaseManager {
         let count: i64 = match content_type {
             ContentType::OCR | ContentType::Accessibility => {
                 sqlx::query_scalar(&sql)
-                    .bind(if has_fts {
-                        fts_query
-                    } else {
-                        "*".to_owned()
-                    })
+                    .bind(if has_fts { fts_query } else { "*".to_owned() })
                     .bind(start_time)
                     .bind(end_time)
                     .bind(min_length.map(|l| l as i64))
@@ -4102,7 +4130,8 @@ impl DatabaseManager {
         .fetch_all(&self.pool)
         .await?;
 
-        let mut map: std::collections::HashMap<String, (i64, i64)> = std::collections::HashMap::new();
+        let mut map: std::collections::HashMap<String, (i64, i64)> =
+            std::collections::HashMap::new();
         for (mid, count) in rows {
             map.entry(mid).or_default().0 = count;
         }
@@ -5384,136 +5413,50 @@ LIMIT ? OFFSET ?
     // UI Events (Input Capture Modality)
     // ============================================================================
 
-    /// Insert a UI event into the database
+    /// Insert a UI event via the write coalescing queue.
     pub async fn insert_ui_event(&self, event: &InsertUiEvent) -> Result<i64, sqlx::Error> {
+        use crate::write_queue::{WriteOp, WriteResult};
         let text_length = event.text_content.as_ref().map(|s| s.len() as i32);
-
-        let mut tx = self.begin_immediate_with_retry().await?;
-
-        let result = sqlx::query(
-            r#"
-            INSERT INTO ui_events (
-                timestamp, session_id, relative_ms, event_type,
-                x, y, delta_x, delta_y,
-                button, click_count, key_code, modifiers,
-                text_content, text_length,
-                app_name, app_pid, window_title, browser_url,
-                element_role, element_name, element_value, element_description,
-                element_automation_id, element_bounds, frame_id
-            ) VALUES (
-                ?1, ?2, ?3, ?4,
-                ?5, ?6, ?7, ?8,
-                ?9, ?10, ?11, ?12,
-                ?13, ?14,
-                ?15, ?16, ?17, ?18,
-                ?19, ?20, ?21, ?22,
-                ?23, ?24, ?25
-            )
-            "#,
-        )
-        .bind(event.timestamp)
-        .bind(&event.session_id)
-        .bind(event.relative_ms)
-        .bind(event.event_type.to_string())
-        .bind(event.x)
-        .bind(event.y)
-        .bind(event.delta_x.map(|v| v as i32))
-        .bind(event.delta_y.map(|v| v as i32))
-        .bind(event.button.map(|v| v as i32))
-        .bind(event.click_count.map(|v| v as i32))
-        .bind(event.key_code.map(|v| v as i32))
-        .bind(event.modifiers.map(|v| v as i32))
-        .bind(&event.text_content)
-        .bind(text_length)
-        .bind(&event.app_name)
-        .bind(event.app_pid)
-        .bind(&event.window_title)
-        .bind(&event.browser_url)
-        .bind(&event.element_role)
-        .bind(&event.element_name)
-        .bind(&event.element_value)
-        .bind(&event.element_description)
-        .bind(&event.element_automation_id)
-        .bind(&event.element_bounds)
-        .bind(event.frame_id)
-        .execute(&mut **tx.conn())
-        .await?;
-
-        let id = result.last_insert_rowid();
-        tx.commit().await?;
-
-        Ok(id)
+        let result = self.write_queue.submit(WriteOp::InsertUiEvent {
+            timestamp: event.timestamp.to_string(),
+            session_id: event.session_id.clone(),
+            relative_ms: event.relative_ms,
+            event_type: event.event_type.to_string(),
+            x: event.x, y: event.y,
+            delta_x: event.delta_x.map(|v| v as i32),
+            delta_y: event.delta_y.map(|v| v as i32),
+            button: event.button.map(|v| v as i32),
+            click_count: event.click_count.map(|v| v as i32),
+            key_code: event.key_code.map(|v| v as i32),
+            modifiers: event.modifiers.map(|v| v as i32),
+            text_content: event.text_content.clone(),
+            text_length,
+            app_name: event.app_name.clone(),
+            app_pid: event.app_pid,
+            window_title: event.window_title.clone(),
+            browser_url: event.browser_url.clone(),
+            element_role: event.element_role.clone(),
+            element_name: event.element_name.clone(),
+            element_value: event.element_value.clone(),
+            element_description: event.element_description.clone(),
+            element_automation_id: event.element_automation_id.clone(),
+            element_bounds: event.element_bounds.clone(),
+            frame_id: event.frame_id,
+        }).await?;
+        match result {
+            WriteResult::Id(id) => Ok(id),
+            _ => unreachable!(),
+        }
     }
 
-    /// Insert multiple UI events in a batch
-    pub async fn insert_ui_events_batch(
-        &self,
-        events: &[InsertUiEvent],
-    ) -> Result<usize, sqlx::Error> {
-        if events.is_empty() {
-            return Ok(0);
-        }
-
-        let mut tx = self.begin_immediate_with_retry().await?;
+    /// Insert multiple UI events via the write coalescing queue.
+    pub async fn insert_ui_events_batch(&self, events: &[InsertUiEvent]) -> Result<usize, sqlx::Error> {
+        if events.is_empty() { return Ok(0); }
         let mut count = 0;
-
         for event in events {
-            let text_length = event.text_content.as_ref().map(|s| s.len() as i32);
-
-            sqlx::query(
-                r#"
-                INSERT INTO ui_events (
-                    timestamp, session_id, relative_ms, event_type,
-                    x, y, delta_x, delta_y,
-                    button, click_count, key_code, modifiers,
-                    text_content, text_length,
-                    app_name, app_pid, window_title, browser_url,
-                    element_role, element_name, element_value, element_description,
-                    element_automation_id, element_bounds, frame_id
-                ) VALUES (
-                    ?1, ?2, ?3, ?4,
-                    ?5, ?6, ?7, ?8,
-                    ?9, ?10, ?11, ?12,
-                    ?13, ?14,
-                    ?15, ?16, ?17, ?18,
-                    ?19, ?20, ?21, ?22,
-                    ?23, ?24, ?25
-                )
-                "#,
-            )
-            .bind(event.timestamp)
-            .bind(&event.session_id)
-            .bind(event.relative_ms)
-            .bind(event.event_type.to_string())
-            .bind(event.x)
-            .bind(event.y)
-            .bind(event.delta_x.map(|v| v as i32))
-            .bind(event.delta_y.map(|v| v as i32))
-            .bind(event.button.map(|v| v as i32))
-            .bind(event.click_count.map(|v| v as i32))
-            .bind(event.key_code.map(|v| v as i32))
-            .bind(event.modifiers.map(|v| v as i32))
-            .bind(&event.text_content)
-            .bind(text_length)
-            .bind(&event.app_name)
-            .bind(event.app_pid)
-            .bind(&event.window_title)
-            .bind(&event.browser_url)
-            .bind(&event.element_role)
-            .bind(&event.element_name)
-            .bind(&event.element_value)
-            .bind(&event.element_description)
-            .bind(&event.element_automation_id)
-            .bind(&event.element_bounds)
-            .bind(event.frame_id)
-            .execute(&mut **tx.conn())
-            .await?;
-
+            self.insert_ui_event(event).await?;
             count += 1;
         }
-
-        tx.commit().await?;
-        debug!("Inserted {} UI events in batch", count);
         Ok(count)
     }
 
@@ -5853,9 +5796,8 @@ LIMIT ? OFFSET ?
         let merged_start: Option<String> = row.try_get("ms")?;
         let merged_end: Option<String> = row.try_get("me")?;
         // Update the survivor row
-        let update_sql = format!(
-            "UPDATE meetings SET meeting_start = ?1, meeting_end = ?2 WHERE id = ?3"
-        );
+        let update_sql =
+            format!("UPDATE meetings SET meeting_start = ?1, meeting_end = ?2 WHERE id = ?3");
         sqlx::query(&update_sql)
             .bind(&merged_start)
             .bind(&merged_end)
@@ -5987,10 +5929,7 @@ LIMIT ? OFFSET ?
             sets.push("source_context = ?5");
         }
 
-        let sql = format!(
-            "UPDATE memories SET {} WHERE id = ?6",
-            sets.join(", ")
-        );
+        let sql = format!("UPDATE memories SET {} WHERE id = ?6", sets.join(", "));
 
         sqlx::query(&sql)
             .bind(&now)
@@ -6132,7 +6071,6 @@ LIMIT ? OFFSET ?
             .fetch_one(&self.pool)
             .await
     }
-
 }
 
 pub fn find_matching_positions(blocks: &[OcrTextBlock], query: &str) -> Vec<TextPosition> {
@@ -6217,7 +6155,9 @@ pub fn find_matching_a11y_positions(tree_json: &str, query: &str) -> Vec<TextPos
     matches.sort_by(|a, b| {
         let area_a = a.bounds.width * a.bounds.height;
         let area_b = b.bounds.width * b.bounds.height;
-        area_b.partial_cmp(&area_a).unwrap_or(std::cmp::Ordering::Equal)
+        area_b
+            .partial_cmp(&area_a)
+            .unwrap_or(std::cmp::Ordering::Equal)
     });
     matches.dedup_by(|a, b| a.text == b.text);
 
