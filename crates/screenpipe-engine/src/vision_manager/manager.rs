@@ -35,6 +35,9 @@ pub struct VisionManagerConfig {
     pub use_all_monitors: bool,
     /// Automatically detect and skip incognito / private browsing windows.
     pub ignore_incognito_windows: bool,
+    pub pause_on_drm_content: bool,
+    /// Languages for OCR recognition.
+    pub languages: Vec<screenpipe_core::Language>,
 }
 
 /// Status of the VisionManager
@@ -274,6 +277,8 @@ impl VisionManager {
         let vision_metrics = self.config.vision_metrics.clone();
         let hot_frame_cache = self.hot_frame_cache.clone();
         let use_pii_removal = self.config.use_pii_removal;
+        let pause_on_drm_content = self.config.pause_on_drm_content;
+        let languages = self.config.languages.clone();
         let power_profile_rx = self.power_profile_rx.clone();
 
         info!(
@@ -298,6 +303,8 @@ impl VisionManager {
                 vision_metrics,
                 hot_frame_cache,
                 use_pii_removal,
+                pause_on_drm_content,
+                languages,
                 power_profile_rx,
             )
             .await
@@ -331,8 +338,28 @@ impl VisionManager {
         }
     }
 
-    /// Get list of currently recording monitor IDs
+    /// Get list of currently recording monitor IDs.
+    /// Removes dead tasks (finished JoinHandles) so MonitorWatcher can restart them.
     pub async fn active_monitors(&self) -> Vec<u32> {
+        // Collect dead task IDs first to avoid holding DashMap refs during removal
+        let dead: Vec<u32> = self
+            .recording_tasks
+            .iter()
+            .filter(|entry| entry.value().is_finished())
+            .map(|entry| *entry.key())
+            .collect();
+
+        for id in &dead {
+            if let Some((_, handle)) = self.recording_tasks.remove(id) {
+                warn!(
+                    "Monitor {} capture task died unexpectedly, removing so it can be restarted",
+                    id
+                );
+                // Await to clean up the JoinHandle
+                let _ = handle.await;
+            }
+        }
+
         self.recording_tasks
             .iter()
             .map(|entry| *entry.key())

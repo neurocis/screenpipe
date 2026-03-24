@@ -112,17 +112,29 @@ async function getCreditBalance(env: Env, userId: string): Promise<number> {
 
 // Per-model query weights — expensive models cost more daily queries
 const MODEL_WEIGHTS: Record<string, number> = {
-  'claude-opus': 5,
+  // Vertex MaaS — free for users (GCP credits), weight=0 so they don't eat daily quota
+  'glm-4.7': 0,
+  'glm-5': 0,
+  'kimi-k2.5': 0,
+  'claude-opus': 15,
   'claude-sonnet': 3,
   'claude-haiku': 1,
   'gemini-3-pro': 3,
   'gemini-3.1-pro': 3,
   'gemini-2.5-pro': 3,
-  'gemini-3-flash': 1,
-  'gemini-2.5-flash': 1,
-  'gpt-4o-mini': 1,
-  'gpt-4o': 3,
-  'gpt-4': 3,
+  'gemini-3-flash': 0,
+  'gemini-2.5-flash': 0,
+  // OpenRouter models
+  'qwen3.5-flash': 1,
+  'qwen3.5-397b': 3,
+  'deepseek-chat': 1,
+  'deepseek-v3.2-speciale': 3,
+  'llama-4-maverick': 1,
+  'llama-4-scout': 1,
+  'qwen3-coder:free': 0,
+  'qwen3-coder': 1,
+  'step-3.5-flash:free': 0,
+  'step-3.5-flash': 0,
 };
 
 export function getModelWeight(model?: string): number {
@@ -148,7 +160,12 @@ const DEFAULT_TIER_CONFIG: Record<UserTier, TierLimits> = {
     allowedModels: [
       'claude-haiku-4-5',
       'gemini-3-flash',
-      'gemini-2.5-flash',
+      'glm-4.7',
+      'glm-5',
+      'kimi-k2.5',
+      'deepseek/deepseek-chat',
+      'qwen/qwen3.5-flash',
+      'meta-llama/llama-4-scout',
     ],
   },
   logged_in: {
@@ -157,15 +174,22 @@ const DEFAULT_TIER_CONFIG: Record<UserTier, TierLimits> = {
     allowedModels: [
       'claude-haiku-4-5',
       'claude-sonnet-4-5',
-      'gpt-4o-mini',
       'gemini-3-flash',
-      'gemini-2.5-flash',
       'gemini-3-pro',
       'gemini-3.1-pro',
+      'glm-4.7',
+      'glm-5',
+      'kimi-k2.5',
+      'deepseek/deepseek-chat',
+      'deepseek/deepseek-v3.2-speciale',
+      'qwen/qwen3.5-flash',
+      'qwen/qwen3.5-397b',
+      'meta-llama/llama-4-scout',
+      'meta-llama/llama-4-maverick',
     ],
   },
   subscribed: {
-    dailyQueries: 5000,
+    dailyQueries: 1500,
     rpm: 60,
     allowedModels: ['*'], // all models
   },

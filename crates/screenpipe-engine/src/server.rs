@@ -36,8 +36,8 @@ use crate::{
         },
         meetings::{
             bulk_delete_meetings_handler, delete_meeting_handler, get_meeting_handler,
-            list_meetings_handler, merge_meetings_handler, start_meeting_handler,
-            stop_meeting_handler, update_meeting_handler,
+            list_meetings_handler, meeting_status_handler, merge_meetings_handler,
+            start_meeting_handler, stop_meeting_handler, update_meeting_handler,
         },
         memories::{
             create_memory_handler, delete_memory_handler, get_memory_handler,
@@ -154,10 +154,14 @@ pub struct AppState {
     pub hot_frame_cache: Arc<HotFrameCache>,
     /// Cloud archive state (initialized via /archive/init endpoint)
     pub archive_state: crate::archive::ArchiveState,
+    /// Local data retention state (auto-delete old data)
+    pub retention_state: crate::retention::RetentionState,
     /// Vault lock manager — encrypts data at rest when locked
     pub vault: screenpipe_vault::VaultManager,
     /// Active manually-started meeting id (set via POST /meetings/start, cleared via POST /meetings/stop)
     pub manual_meeting: Arc<tokio::sync::RwLock<Option<i64>>>,
+    /// Browser extension bridge — relays JS eval requests to the connected extension
+    pub browser_bridge: Arc<crate::routes::browser::BrowserBridge>,
 }
 
 pub struct SCServer {
@@ -439,12 +443,14 @@ impl SCServer {
             frame_extraction_semaphore: Arc::new(tokio::sync::Semaphore::new(3)),
             hot_frame_cache,
             archive_state: crate::archive::ArchiveState::new(),
+            retention_state: crate::retention::RetentionState::new(),
             pipe_permissions: self.pipe_permissions.clone(),
             vault: screenpipe_vault::VaultManager::new(self.screenpipe_dir.clone()),
             manual_meeting: self
                 .manual_meeting
                 .clone()
                 .unwrap_or_else(|| Arc::new(tokio::sync::RwLock::new(None))),
+            browser_bridge: crate::routes::browser::BrowserBridge::new(),
         });
 
         let cors = CorsLayer::new()
@@ -483,6 +489,7 @@ impl SCServer {
             .post("/speakers/reassign", reassign_speaker_handler)
             .post("/speakers/undo-reassign", undo_speaker_reassign_handler)
             .get("/meetings", list_meetings_handler)
+            .get("/meetings/status", meeting_status_handler)
             .post("/meetings/merge", merge_meetings_handler)
             .post("/meetings/bulk-delete", bulk_delete_meetings_handler)
             .post("/meetings/start", start_meeting_handler)
@@ -556,6 +563,16 @@ impl SCServer {
             .route(
                 "/archive/run",
                 axum::routing::post(crate::archive::archive_run),
+            )
+            // Local data retention (auto-delete old data)
+            .route(
+                "/retention/configure",
+                axum::routing::post(crate::retention::retention_configure),
+            )
+            .route("/retention/status", get(crate::retention::retention_status))
+            .route(
+                "/retention/run",
+                axum::routing::post(crate::retention::retention_run),
             )
             // Vision status endpoint (not in OpenAPI spec to avoid oasgen registration issues)
             .route("/vision/status", get(api_vision_status))
@@ -645,6 +662,14 @@ impl SCServer {
                     axum::routing::post(crate::routes::pipe_store::pipe_store_install),
                 )
                 .route(
+                    "/store/update",
+                    axum::routing::post(crate::routes::pipe_store::pipe_store_update),
+                )
+                .route(
+                    "/store/check-updates",
+                    axum::routing::get(crate::routes::pipe_store::pipe_store_check_updates),
+                )
+                .route(
                     "/store/:slug",
                     axum::routing::get(crate::routes::pipe_store::pipe_store_detail)
                         .delete(crate::routes::pipe_store::pipe_store_unpublish),
@@ -702,6 +727,37 @@ impl SCServer {
             .route("/ws/events", get(ws_events_handler))
             .route("/ws/health", get(ws_health_handler))
             .route("/ws/metrics", get(ws_metrics_handler))
+            // Browser extension bridge
+            .route(
+                "/browser/ws",
+                get({
+                    let bridge = app_state.browser_bridge.clone();
+                    move |ws| {
+                        crate::routes::browser::browser_ws_handler(ws, axum::extract::State(bridge))
+                    }
+                }),
+            )
+            .route(
+                "/browser/eval",
+                axum::routing::post({
+                    let bridge = app_state.browser_bridge.clone();
+                    move |body| {
+                        crate::routes::browser::browser_eval_handler(
+                            axum::extract::State(bridge),
+                            body,
+                        )
+                    }
+                }),
+            )
+            .route(
+                "/browser/status",
+                get({
+                    let bridge = app_state.browser_bridge.clone();
+                    move || {
+                        crate::routes::browser::browser_status_handler(axum::extract::State(bridge))
+                    }
+                }),
+            )
             .route(
                 "/ws/dictation",
                 get(crate::routes::dictation::ws_dictation_handler),

@@ -5,22 +5,33 @@ use super::get_base_dir;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use specta::Type;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use tauri::AppHandle;
 use tauri_plugin_store::StoreBuilder;
 use tracing::error;
+
+/// Cached store instance — built once, reused for the lifetime of the process.
+/// Avoids TOCTOU race in StoreBuilder::build() when called multiple times during
+/// startup (settings init, onboarding init, tray setup all call get_store).
+static STORE_CACHE: OnceLock<Arc<tauri_plugin_store::Store<tauri::Wry>>> = OnceLock::new();
 
 pub fn get_store(
     app: &AppHandle,
     _profile_name: Option<String>, // Keep parameter for API compatibility but ignore it
 ) -> anyhow::Result<Arc<tauri_plugin_store::Store<tauri::Wry>>> {
+    if let Some(cached) = STORE_CACHE.get() {
+        return Ok(cached.clone());
+    }
+
     let base_dir = get_base_dir(app, None)?;
     let store_path = base_dir.join("store.bin");
 
-    // Build and return the store wrapped in Arc
-    StoreBuilder::new(app, store_path)
+    let store = StoreBuilder::new(app, store_path)
         .build()
-        .map_err(|e| anyhow::anyhow!(e))
+        .map_err(|e| anyhow::anyhow!(e))?;
+
+    // If another thread raced us, use their instance
+    Ok(STORE_CACHE.get_or_init(|| store).clone())
 }
 
 #[derive(Serialize, Deserialize, Type, Clone)]
@@ -183,8 +194,8 @@ pub struct SettingsStore {
     pub chat_always_on_top: bool,
 
     /// Show restart notifications when audio/vision capture stalls.
-    /// Disable to suppress all capture-stall notification popups.
-    #[serde(rename = "showRestartNotifications", default = "default_true")]
+    /// Disabled by default for now until the stall detector is more reliable.
+    #[serde(rename = "showRestartNotifications", default)]
     pub show_restart_notifications: bool,
 
     /// Catch-all for fields added by the frontend (e.g. chatHistory)
@@ -263,7 +274,7 @@ impl Default for AIPreset {
             prompt: String::new(),
             provider: AIProviderType::ScreenpipeCloud,
             url: "https://api.screenpi.pe/v1".to_string(),
-            model: "claude-haiku-4-5".to_string(),
+            model: "qwen/qwen3.5-flash-02-23".to_string(),
             default_preset: false,
             api_key: None,
             max_context_chars: 512000,
@@ -410,7 +421,7 @@ impl Default for SettingsStore {
 "#.to_string(),
             provider: AIProviderType::ScreenpipeCloud,
             url: "https://api.screenpi.pe/v1".to_string(),
-            model: "claude-haiku-4-5".to_string(),
+            model: "qwen/qwen3.5-flash-02-23".to_string(),
             default_preset: true,
             api_key: None,
             max_context_chars: 128000,
@@ -492,7 +503,7 @@ impl Default for SettingsStore {
             overlay_mode: "window".to_string(),
             show_overlay_in_screen_recording: false,
             chat_always_on_top: true,
-            show_restart_notifications: true,
+            show_restart_notifications: false,
             extra: std::collections::HashMap::new(),
         }
     }
@@ -510,6 +521,21 @@ impl SettingsStore {
                 obj.remove("enableUiEvents");
             } else if let Some(v) = obj.remove("enableUiEvents") {
                 obj.insert("enableAccessibility".to_string(), v);
+            }
+
+            // Temporary one-time migration: disable restart notifications for all
+            // existing users until the stall detector is more reliable. Users can
+            // still opt back in manually from Settings; once they've seen this
+            // version, we stop overriding their choice.
+            if !obj.contains_key("restartNotificationsDefaultedOff") {
+                obj.insert(
+                    "showRestartNotifications".to_string(),
+                    Value::Bool(false),
+                );
+                obj.insert(
+                    "restartNotificationsDefaultedOff".to_string(),
+                    Value::Bool(true),
+                );
             }
 
             // Sanitize unknown provider types in aiPresets to prevent deserialization failures
@@ -541,6 +567,7 @@ impl SettingsStore {
                     }
                 }
             }
+
         }
         val
     }
@@ -642,8 +669,23 @@ impl SettingsStore {
 pub fn init_store(app: &AppHandle) -> Result<SettingsStore, String> {
     println!("Initializing settings store");
 
-    let (store, should_save) = match SettingsStore::get(app) {
-        Ok(Some(store)) => (store, false), // Loaded successfully, don't overwrite
+    let raw_obj = get_store(app, None)
+        .ok()
+        .and_then(|store| store.get("settings"))
+        .and_then(|raw| raw.as_object().cloned());
+
+    let should_persist_restart_notification_migration = raw_obj
+        .as_ref()
+        .map(|obj| !obj.contains_key("restartNotificationsDefaultedOff"))
+        .unwrap_or(false);
+
+    let needs_haiku_migration = raw_obj
+        .as_ref()
+        .map(|obj| !obj.contains_key("haikuToQwenFlashMigrated"))
+        .unwrap_or(false);
+
+    let (mut store, should_save) = match SettingsStore::get(app) {
+        Ok(Some(store)) => (store, should_persist_restart_notification_migration || needs_haiku_migration),
         Ok(None) => (SettingsStore::default(), true), // New store, save defaults
         Err(e) => {
             // Fallback to defaults when deserialization fails (e.g., corrupted store)
@@ -657,8 +699,26 @@ pub fn init_store(app: &AppHandle) -> Result<SettingsStore, String> {
         }
     };
 
+    // One-time migration: move default Haiku users to Qwen3.5 Flash
+    if needs_haiku_migration {
+        for preset in &mut store.ai_presets {
+            let is_screenpipe = matches!(preset.provider, AIProviderType::Pi | AIProviderType::ScreenpipeCloud);
+            if is_screenpipe && preset.model == "claude-haiku-4-5" {
+                tracing::info!("migrating default Haiku preset to Qwen3.5 Flash");
+                preset.model = "qwen/qwen3.5-flash-02-23".to_string();
+            }
+        }
+        // Persist the flag so this runs only once
+        store.extra.insert(
+            "haikuToQwenFlashMigrated".to_string(),
+            Value::Bool(true),
+        );
+    }
+
     if should_save {
-        store.save(app).unwrap();
+        if let Err(e) = store.save(app) {
+            error!("Failed to save initial settings store (non-fatal): {}", e);
+        }
     }
     Ok(store)
 }
@@ -681,7 +741,9 @@ pub fn init_onboarding_store(app: &AppHandle) -> Result<OnboardingStore, String>
     };
 
     if should_save {
-        onboarding.save(app).unwrap();
+        if let Err(e) = onboarding.save(app) {
+            error!("Failed to save initial onboarding store (non-fatal): {}", e);
+        }
     }
     Ok(onboarding)
 }

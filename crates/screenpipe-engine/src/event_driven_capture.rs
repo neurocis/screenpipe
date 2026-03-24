@@ -20,6 +20,7 @@ use screenpipe_screen::frame_comparison::{FrameComparer, FrameComparisonConfig};
 use screenpipe_screen::monitor::SafeMonitor;
 use screenpipe_screen::snapshot_writer::SnapshotWriter;
 use screenpipe_screen::utils::capture_monitor_image;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -214,6 +215,8 @@ pub async fn event_driven_capture_loop(
     vision_metrics: Arc<screenpipe_screen::PipelineMetrics>,
     hot_frame_cache: Option<Arc<HotFrameCache>>,
     use_pii_removal: bool,
+    pause_on_drm_content: bool,
+    languages: Vec<screenpipe_core::Language>,
     power_profile_rx: Option<watch::Receiver<PowerProfile>>,
 ) -> Result<()> {
     info!(
@@ -242,6 +245,10 @@ pub async fn event_driven_capture_loop(
     // Track last successful DB write time — dedup is bypassed after 30s
     // to guarantee the timeline always has periodic entries
     let mut last_db_write = Instant::now();
+    // Per-device elements dedup cache: device_name → (last_frame_id, last_content_hash)
+    // When consecutive frames have the same content_hash, we skip inserting elements
+    // and reference the previous frame's elements instead.
+    let mut last_elements_cache: HashMap<String, (i64, i64)> = HashMap::new();
     // Debounce consecutive capture errors — log error! once on first failure,
     // then suppress until success. Prevents monitor disconnect from flooding
     // Sentry with 100k+ identical events.
@@ -263,8 +270,11 @@ pub async fn event_driven_capture_loop(
             &tree_walker_config,
             &CaptureTrigger::Manual,
             use_pii_removal,
+            pause_on_drm_content,
+            &languages,
             None, // first capture — no previous hash
             last_db_write,
+            None, // first capture — no elements ref
         )
         .await
         {
@@ -276,6 +286,10 @@ pub async fn event_driven_capture_loop(
                 if let Some(ref result) = output.result {
                     last_content_hash = result.content_hash;
                     last_db_write = Instant::now();
+                    // Update elements cache for this device (first frame = anchor)
+                    if let Some(hash) = result.content_hash {
+                        last_elements_cache.insert(device_name.clone(), (result.frame_id, hash));
+                    }
                     vision_metrics.record_capture();
                     vision_metrics.record_db_write(Duration::from_millis(result.duration_ms));
                     if let Some(ref cache) = hot_frame_cache {
@@ -307,6 +321,11 @@ pub async fn event_driven_capture_loop(
 
         // Skip capture while the screen is locked / screensaver active
         if crate::sleep_monitor::screen_is_locked() {
+            tokio::time::sleep(poll_interval).await;
+            continue;
+        }
+
+        if crate::drm_detector::drm_content_paused() {
             tokio::time::sleep(poll_interval).await;
             continue;
         }
@@ -386,12 +405,33 @@ pub async fn event_driven_capture_loop(
                 CaptureTrigger::AppSwitch { .. } | CaptureTrigger::WindowFocus { .. }
             ) {
                 last_content_hash = None;
+                // Also reset elements cache on context change
+                last_elements_cache.remove(&device_name);
             }
 
             if state.can_capture() {
                 // Heartbeat: record that the loop is alive and attempting a capture.
                 // This keeps health "ok" even if the DB write below times out.
                 vision_metrics.record_capture_attempt();
+
+                // Compute elements_ref for frame-to-frame element dedup.
+                // If the current content_hash matches the previous frame's hash
+                // for this device, reference that frame's elements instead of
+                // inserting duplicate element rows.
+                let elements_ref = if let Some(hash) = last_content_hash {
+                    if let Some(&(prev_frame_id, prev_hash)) = last_elements_cache.get(&device_name)
+                    {
+                        if hash == prev_hash && hash != 0 {
+                            Some(prev_frame_id)
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
 
                 // Timeout prevents the capture loop from blocking indefinitely
                 // if the DB is truly stuck. 15s is generous — normal captures take
@@ -408,8 +448,11 @@ pub async fn event_driven_capture_loop(
                         &tree_walker_config,
                         &trigger,
                         use_pii_removal,
+                        pause_on_drm_content,
+                        &languages,
                         last_content_hash,
                         last_db_write,
+                        elements_ref,
                     ),
                 )
                 .await;
@@ -437,6 +480,16 @@ pub async fn event_driven_capture_loop(
                             // Full capture — update hash, metrics, cache
                             last_content_hash = result.content_hash;
                             last_db_write = Instant::now();
+
+                            // Update elements cache: only when we inserted new elements
+                            // (not when we referenced another frame's elements)
+                            if !output.elements_deduped {
+                                if let Some(hash) = result.content_hash {
+                                    last_elements_cache
+                                        .insert(device_name.clone(), (result.frame_id, hash));
+                                }
+                            }
+
                             vision_metrics.record_capture();
                             vision_metrics
                                 .record_db_write(Duration::from_millis(result.duration_ms));
@@ -446,11 +499,12 @@ pub async fn event_driven_capture_loop(
                             }
 
                             debug!(
-                                "event capture: trigger={}, frame_id={}, text_source={:?}, dur={}ms",
+                                "event capture: trigger={}, frame_id={}, text_source={:?}, dur={}ms, elements_deduped={}",
                                 trigger.as_str(),
                                 result.frame_id,
                                 result.text_source,
-                                result.duration_ms
+                                result.duration_ms,
+                                output.elements_deduped
                             );
                         } else {
                             // Content dedup or window filter — capture skipped
@@ -463,6 +517,14 @@ pub async fn event_driven_capture_loop(
                     }
                     Ok(Err(e)) => {
                         consecutive_capture_errors += 1;
+
+                        // Mark captured on failure to reset idle timer — without
+                        // this, needs_idle_capture() fires every poll tick (50ms)
+                        // once 30s elapses, creating ~20 capture attempts/second
+                        // on systems where capture fundamentally can't work
+                        // (e.g. Wayland without ZwlrScreencopy).
+                        state.mark_captured();
+
                         if consecutive_capture_errors == 1 {
                             // First failure — log at error level (shows in Sentry)
                             error!(
@@ -483,8 +545,19 @@ pub async fn event_driven_capture_loop(
                                 monitor_id, consecutive_capture_errors, e
                             );
                         }
+
+                        // Exponential backoff for persistent failures — avoids
+                        // hammering a broken capture path (missing Wayland
+                        // protocol, permission denied, etc.) while still
+                        // recovering quickly from transient errors.
+                        if consecutive_capture_errors >= 3 {
+                            let backoff_secs = (consecutive_capture_errors as u64 / 3).min(30); // cap at 30s
+                            tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
+                        }
                     }
                     Err(_timeout) => {
+                        consecutive_capture_errors += 1;
+                        state.mark_captured();
                         warn!(
                             "event capture timed out (trigger={}, monitor={}) — DB pool may be saturated",
                             trigger.as_str(),
@@ -548,6 +621,8 @@ struct CaptureOutput {
     /// The captured image — reused for frame comparer update to avoid taking
     /// a redundant extra screenshot after each capture.
     image: image::DynamicImage,
+    /// Whether elements were deduped (referenced another frame's elements).
+    elements_deduped: bool,
 }
 
 fn resolve_capture_metadata(
@@ -607,8 +682,11 @@ async fn do_capture(
     tree_walker_config: &TreeWalkerConfig,
     trigger: &CaptureTrigger,
     use_pii_removal: bool,
+    pause_on_drm_content: bool,
+    languages: &[screenpipe_core::Language],
     previous_content_hash: Option<i64>,
     last_db_write: Instant,
+    elements_ref_frame_id: Option<i64>,
 ) -> Result<CaptureOutput> {
     let captured_at = Utc::now();
 
@@ -639,6 +717,7 @@ async fn do_capture(
             return Ok(CaptureOutput {
                 result: None,
                 image,
+                elements_deduped: false,
             });
         }
         TreeWalkResult::NotFound => None,
@@ -665,6 +744,7 @@ async fn do_capture(
                         return Ok(CaptureOutput {
                             result: None,
                             image,
+                            elements_deduped: false,
                         });
                     }
                 }
@@ -694,6 +774,7 @@ async fn do_capture(
             return Ok(CaptureOutput {
                 result: None,
                 image,
+                elements_deduped: false,
             });
         } else if crate::sleep_monitor::screen_is_locked() {
             // Screen was marked locked but now a real app is focused — unlock
@@ -714,6 +795,21 @@ async fn do_capture(
         return Ok(CaptureOutput {
             result: None,
             image,
+            elements_deduped: false,
+        });
+    }
+
+    // DRM content detection: set global pause flag so monitor watcher
+    // stops all monitors and releases SCK handles.
+    if crate::drm_detector::check_and_update_drm_state(
+        pause_on_drm_content,
+        app_name_owned.as_deref(),
+        browser_url_owned.as_deref(),
+    ) {
+        return Ok(CaptureOutput {
+            result: None,
+            image,
+            elements_deduped: false,
         });
     }
 
@@ -730,15 +826,19 @@ async fn do_capture(
         focused: true, // event-driven captures are always for the focused window
         capture_trigger: trigger.as_str(),
         use_pii_removal,
+        languages: languages.to_vec(),
+        elements_ref_frame_id,
     };
 
     let result = paired_capture(&ctx, tree_snapshot.as_ref()).await?;
+    let deduped = elements_ref_frame_id.is_some();
     // Extract image from Arc for comparer reuse. Arc::try_unwrap succeeds
     // because paired_capture no longer retains a clone.
     let image = Arc::try_unwrap(ctx.image).unwrap_or_else(|arc| (*arc).clone());
     Ok(CaptureOutput {
         result: Some(result),
         image,
+        elements_deduped: deduped,
     })
 }
 

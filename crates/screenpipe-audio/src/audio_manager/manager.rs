@@ -14,7 +14,6 @@ use std::{
     time::Duration,
 };
 use tokio::{
-    join,
     sync::{Mutex, RwLock},
     task::JoinHandle,
 };
@@ -35,7 +34,6 @@ use crate::{
     metrics::AudioPipelineMetrics,
     segmentation::segmentation_manager::SegmentationManager,
     transcription::{
-        deepgram::streaming::stream_transcription_deepgram,
         engine::TranscriptionEngine,
         handle_new_transcript,
         stt::{process_audio_input, SAMPLE_RATE},
@@ -48,11 +46,26 @@ use crate::{
     AudioInput, TranscriptionResult,
 };
 
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum AudioManagerStatus {
     Running,
     Paused,
     Stopped,
+}
+
+/// Meeting event data for calendar-assisted speaker diarization.
+/// Mirrors the MeetingEvent struct from screenpipe-events for deserialization.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct MeetingEventData {
+    app: String,
+    timestamp: DateTime<Utc>,
+    #[serde(default)]
+    calendar_title: Option<String>,
+    #[serde(default)]
+    calendar_attendees: Option<Vec<String>>,
 }
 
 type RecordingHandlesMap = DashMap<AudioDevice, Arc<Mutex<JoinHandle<Result<()>>>>>;
@@ -211,6 +224,18 @@ impl AudioManager {
 
         start_device_monitor(self_arc.clone(), self.device_manager.clone()).await?;
 
+        // Seed known speakers from DB on startup
+        seed_speakers_from_db(&self.db, &self.segmentation_manager).await;
+
+        // Subscribe to meeting events for calendar-assisted speaker diarization
+        {
+            let seg_mgr = self.segmentation_manager.clone();
+            let db = self.db.clone();
+            tokio::spawn(async move {
+                run_meeting_speaker_constraint_loop(seg_mgr, db).await;
+            });
+        }
+
         info!("audio manager started");
 
         Ok(())
@@ -338,55 +363,23 @@ impl AudioManager {
         let audio_chunk_duration = options.audio_chunk_duration;
         let recording_sender = self.recording_sender.clone();
         let is_running = self.device_manager.is_running_mut(device).unwrap();
-        let languages = options.languages.clone();
-        let deepgram_api_key = options.deepgram_api_key.clone();
-        let realtime_enabled = options.enable_realtime;
         let device_clone = device.clone();
         let metrics = self.metrics.clone();
 
         let recording_handle = tokio::spawn(async move {
-            let record_and_transcribe_handle = tokio::spawn(record_and_transcribe(
+            let record_result = tokio::spawn(record_and_transcribe(
                 stream.clone(),
                 audio_chunk_duration,
                 recording_sender.clone(),
                 is_running.clone(),
                 metrics,
-            ));
-
-            let realtime_handle = if realtime_enabled {
-                Some(tokio::spawn(stream_transcription_deepgram(
-                    stream,
-                    languages,
-                    is_running,
-                    deepgram_api_key,
-                )))
-            } else {
-                None
-            };
-
-            let (record_result, realtime_result) = if let Some(handle) = realtime_handle {
-                join!(record_and_transcribe_handle, handle)
-            } else {
-                (record_and_transcribe_handle.await, Ok(Ok(())))
-            };
+            ))
+            .await;
 
             // Check for JoinError (task panic/cancel)
-            if record_result.is_err() || realtime_result.is_err() {
-                let mut e = anyhow!("record_device failed");
-
-                if record_result.is_err() {
-                    let record_error = record_result.err().unwrap();
-                    error!("Record and transcribe error: {}", record_error);
-                    e = e.context(record_error)
-                }
-
-                if realtime_result.is_err() {
-                    let realtime_error = realtime_result.err().unwrap();
-                    error!("Realtime recording error: {}", realtime_error);
-                    e = e.context(realtime_error);
-                }
-
-                return Err(e);
+            if let Err(ref e) = record_result {
+                error!("Record and transcribe error: {}", e);
+                return Err(anyhow!("record_device failed: {}", e));
             }
 
             // Check for inner Result errors (record_and_transcribe returned Err)
@@ -396,13 +389,6 @@ impl AudioManager {
                     device_clone, e
                 );
                 return Err(anyhow!("record_device {} failed: {}", device_clone, e));
-            }
-            if let Ok(Err(ref e)) = realtime_result {
-                warn!(
-                    "realtime recording for device {} exited with error: {}",
-                    device_clone, e
-                );
-                return Err(anyhow!("realtime {} failed: {}", device_clone, e));
             }
 
             warn!(
@@ -915,6 +901,83 @@ impl AudioManager {
         debug!("cleaned up stale device {} for restart", device_name);
 
         Ok(())
+    }
+}
+
+/// Seed the embedding manager with named speakers from the DB.
+/// This allows returning voices to be recognized immediately instead of
+/// starting anonymous for the first 30+ seconds.
+async fn seed_speakers_from_db(db: &Arc<DatabaseManager>, seg_mgr: &Arc<SegmentationManager>) {
+    match db.get_named_speakers_with_centroids().await {
+        Ok(speakers) if !speakers.is_empty() => {
+            for (_db_id, name, centroid) in &speakers {
+                let emb = ndarray::Array1::from_vec(centroid.clone());
+                seg_mgr.seed_speaker(emb);
+                debug!("seeded known speaker '{}' into embedding manager", name);
+            }
+            info!(
+                "seeded {} known speakers from DB into embedding manager",
+                speakers.len()
+            );
+        }
+        Ok(_) => {
+            debug!("no named speakers with centroids found in DB to seed");
+        }
+        Err(e) => {
+            warn!("failed to query named speakers for seeding: {}", e);
+        }
+    }
+}
+
+/// Background task that subscribes to meeting_started / meeting_ended events
+/// and adjusts speaker clustering constraints accordingly.
+///
+/// On meeting_started with N attendees:
+///   1. Clear existing speaker clusters (prevent cross-meeting contamination)
+///   2. Re-seed known speakers from DB
+///   3. Set max_speakers to N+1 (extra slot for AirPods loopback)
+///
+/// On meeting_ended:
+///   1. Reset max_speakers to unlimited
+///   2. Re-seed known speakers for non-meeting recognition
+async fn run_meeting_speaker_constraint_loop(
+    seg_mgr: Arc<SegmentationManager>,
+    db: Arc<DatabaseManager>,
+) {
+    use futures::StreamExt;
+
+    let mut meeting_sub =
+        screenpipe_events::subscribe_to_event::<MeetingEventData>("meeting_started");
+    let mut ended_sub = screenpipe_events::subscribe_to_event::<MeetingEventData>("meeting_ended");
+
+    info!("calendar-assisted speaker diarization: listening for meeting events");
+
+    loop {
+        tokio::select! {
+            Some(event) = meeting_sub.next() => {
+                if let Some(attendees) = &event.data.calendar_attendees {
+                    if attendees.len() >= 2 {
+                        let max = attendees.len() + 1; // +1 for AirPods loopback
+                        info!(
+                            "meeting started with {} attendees, constraining to {} speakers",
+                            attendees.len(),
+                            max
+                        );
+                        // Phase 3: Clear + re-seed + constrain
+                        seg_mgr.clear_speakers();
+                        seed_speakers_from_db(&db, &seg_mgr).await;
+                        seg_mgr.set_max_speakers(max);
+                    }
+                }
+                // No calendar attendees → no constraint, current behavior preserved
+            }
+            Some(_event) = ended_sub.next() => {
+                info!("meeting ended, resetting speaker constraints");
+                seg_mgr.reset_max_speakers();
+                // Re-seed for non-meeting recognition
+                seed_speakers_from_db(&db, &seg_mgr).await;
+            }
+        }
     }
 }
 

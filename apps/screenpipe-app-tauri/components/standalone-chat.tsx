@@ -81,6 +81,49 @@ const STATIC_MENTION_SUGGESTIONS: MentionSuggestion[] = [
 
 // TOOLS definition removed — search is now handled by Pi's screenpipe-search skill
 
+/**
+ * Extract tier info from gateway error JSON embedded in error strings and
+ * return a user-facing message appropriate to their actual subscription tier.
+ */
+function buildDailyLimitMessage(errorStr: string): string {
+  try {
+    const isCostLimit = errorStr.includes("daily_cost_limit_exceeded");
+    const isRateLimit = errorStr.includes("rate limit") || errorStr.includes("Rate limit");
+
+    if (isRateLimit) {
+      return "This model is temporarily rate-limited. Try again in a few seconds, or switch to a different model.";
+    }
+
+    if (isCostLimit) {
+      return "Daily usage limit reached for this model. Try a lighter model or wait until tomorrow.";
+    }
+
+    const tierMatch = errorStr.match(/"tier":\s*"([^"]+)"/);
+    const tier = tierMatch?.[1];
+
+    if (tier === "subscribed") {
+      return "You've hit your daily limit. Switch to a free model (Qwen3 Coder, Gemini Flash) for unlimited usage.";
+    } else if (tier === "logged_in") {
+      return "You've used your free queries for today. Switch to a free model (Qwen3 Coder, Gemini Flash) for unlimited usage, or upgrade to Pro.";
+    } else {
+      return "You've used your free queries for today. Sign in for more, or switch to a free model (Qwen3 Coder, Gemini Flash).";
+    }
+  } catch {
+    return "You've reached your daily limit. Try a free model like Qwen3 Coder or Gemini Flash.";
+  }
+}
+
+/** Extract the gateway-reported tier from an error string, if present. */
+function extractTierFromError(errorStr: string): "anonymous" | "logged_in" | "subscribed" | undefined {
+  try {
+    const match = errorStr.match(/"tier":\s*"([^"]+)"/);
+    if (match?.[1] === "subscribed" || match?.[1] === "logged_in" || match?.[1] === "anonymous") {
+      return match[1] as "anonymous" | "logged_in" | "subscribed";
+    }
+  } catch {}
+  return undefined;
+}
+
 // Helper to get timezone offset string (e.g., "+1" or "-5")
 function getTimezoneOffsetString(): string {
   const offsetMinutes = new Date().getTimezoneOffset();
@@ -878,6 +921,7 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
   const [showUpgradeDialog, setShowUpgradeDialog] = useState(false);
   const [upgradeReason, setUpgradeReason] = useState<"daily_limit" | "model_not_allowed" | "rate_limit">("daily_limit");
   const [upgradeResetsAt, setUpgradeResetsAt] = useState<string | undefined>();
+  const [upgradeTier, setUpgradeTier] = useState<"anonymous" | "logged_in" | "subscribed" | undefined>();
   const [scheduleDialogMessage, setScheduleDialogMessage] = useState<{ prompt: string; response: string } | null>(null);
   const [prefillContext, setPrefillContext] = useState<string | null>(null);
   const [prefillSource, setPrefillSource] = useState<string>("search");
@@ -895,11 +939,13 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
   const piMessageIdRef = useRef<string | null>(null);
   const piContentBlocksRef = useRef<ContentBlock[]>([]);
   const piStartInFlightRef = useRef(false);
+  const piFirstCallRetried = useRef(false);
   const piStoppedIntentionallyRef = useRef(false);
   const piCrashCountRef = useRef(0);
   const piLastCrashRef = useRef(0);
   const piThinkingStartRef = useRef<number | null>(null);
   const piSessionSyncedRef = useRef(false);
+  const piRunningConfigRef = useRef<{ provider: string; model: string; token: string | null } | null>(null);
 
   // Active pipe execution (when watching a running pipe)
   const [activePipeExecution, setActivePipeExecution] = useState<{
@@ -1226,6 +1272,23 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  // Pick up pending conversation from pipe execution history (set via localStorage
+  // because the emit event is lost during page navigation/remount)
+  useEffect(() => {
+    const pendingId = localStorage.getItem("pending-chat-conversation");
+    if (pendingId) {
+      localStorage.removeItem("pending-chat-conversation");
+      (async () => {
+        const { loadConversationFile } = await import("@/lib/chat-storage");
+        const conv = await loadConversationFile(pendingId);
+        if (conv) {
+          loadConversation(conv);
+        }
+      })();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   const appMentionSuggestions = React.useMemo(
     () => buildAppMentionSuggestions(appItems, APP_SUGGESTION_LIMIT),
     [appItems]
@@ -1427,6 +1490,10 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
   };
 
   useEffect(() => {
+    // Don't resolve preset until settings are loaded from the store —
+    // before that, settings.aiPresets contains only the hardcoded default,
+    // which would cause Pi to start with the wrong model then immediately restart.
+    if (!isSettingsLoaded) return;
     // Don't overwrite pipe-specific preset when watching a pipe execution
     if (activePipeExecution) return;
     const defaultPreset = settings.aiPresets?.find((p) => p.defaultPreset);
@@ -1438,7 +1505,7 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
       }
       return next;
     });
-  }, [settings.aiPresets]);
+  }, [settings.aiPresets, isSettingsLoaded]);
 
   const hasPresets = settings.aiPresets && settings.aiPresets.length > 0;
   // All providers now route through Pi — isPi is always true when we have a preset
@@ -1523,17 +1590,24 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
   // Pi project dir is managed Rust-side at boot
 
   // Build Pi provider config from active preset
-  const buildProviderConfig = useCallback(() => {
-    if (!activePreset) return null;
+  const buildProviderConfig = useCallback((preset?: AIPreset | null) => {
+    const p = preset || activePreset;
+    if (!p) return null;
+    // Combine the screenpipe search instructions with the user's preset prompt.
+    // This is passed via --append-system-prompt to Pi, enabling Anthropic prompt
+    // caching (90% input cost reduction on subsequent messages).
+    const presetPrompt = p.prompt || "";
+    const systemPrompt = `${buildSystemPrompt()}\n\n${presetPrompt}`.trim() || null;
     return {
-      provider: activePreset.provider,
-      url: activePreset.url || "",
-      model: activePreset.model || "",
-      apiKey: ("apiKey" in activePreset ? (activePreset.apiKey as string) : null) || null,
-      maxTokens: (activePreset as any).maxTokens ?? 4096,
+      provider: p.provider,
+      url: p.url || "",
+      model: p.model || "",
+      apiKey: ("apiKey" in p ? (p.apiKey as string) : null) || null,
+      maxTokens: (p as any).maxTokens ?? 4096,
+      systemPrompt,
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activePreset?.provider, activePreset?.url, activePreset?.model, activePreset?.apiKey, (activePreset as any)?.maxTokens]);
+  }, [activePreset?.provider, activePreset?.url, activePreset?.model, activePreset?.apiKey, (activePreset as any)?.maxTokens, activePreset?.prompt]);
 
   // Check Pi status on mount — Pi is auto-started at app boot by Rust
   useEffect(() => {
@@ -1560,49 +1634,17 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
     return () => clearInterval(interval);
   }, []);
 
-  // Track what provider+model Pi is actually running with (survives remounts via ref)
-  const piRunningConfigRef = useRef<{ provider?: string; model?: string; token?: string | null }>({});
-  const piRestartTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-
-  // Restart Pi when user switches preset so the new model takes effect immediately.
-  // Pi uses CLI args from startup, so config-only updates don't change the running model.
-  // Debounced to collapse rapid settings saves into a single restart.
-  useEffect(() => {
-    if (!activePreset) return;
-    const running = piRunningConfigRef.current;
-    const currentToken = settings.user?.token ?? null;
-    const configChanged = running.provider !== undefined &&
-      (running.provider !== activePreset.provider || running.model !== activePreset.model);
-    const tokenChanged = running.token !== undefined && running.token !== currentToken;
-
-    if (!configChanged && !tokenChanged) {
-      // First mount or same config — just record what we expect Pi to be running
-      if (running.provider === undefined) {
-        piRunningConfigRef.current = { provider: activePreset.provider, model: activePreset.model, token: currentToken };
-      }
-      return;
-    }
-
-    // Debounce: cancel any pending restart, schedule new one
-    if (piRestartTimerRef.current) clearTimeout(piRestartTimerRef.current);
-    piRestartTimerRef.current = setTimeout(() => {
-      piRestartTimerRef.current = null;
-      const providerConfig = buildProviderConfig();
-      console.log("[Pi] Preset changed, restarting:", providerConfig?.provider, providerConfig?.model);
-      piRunningConfigRef.current = { provider: activePreset.provider, model: activePreset.model, token: currentToken };
-      // Reset session sync flag — Pi restarts fresh without conversation context,
-      // so the next message will re-inject chat history.
-      piSessionSyncedRef.current = false;
-      commands.piUpdateConfig(settings.user?.token ?? null, providerConfig).catch((e) => {
-        console.error("[Pi] Preset switch failed:", e);
-      });
-    }, 400);
-
-    return () => {
-      if (piRestartTimerRef.current) clearTimeout(piRestartTimerRef.current);
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activePreset?.provider, activePreset?.model, settings.user?.token]);
+  // Restart Pi explicitly when user saves a preset — no useEffect, no debounce.
+  // Called directly from the AIPresetsSelector onPresetSaved callback.
+  const handlePiRestart = useCallback((preset: AIPreset) => {
+    const providerConfig = buildProviderConfig(preset);
+    console.log("[Pi] User saved preset, restarting:", providerConfig?.provider, providerConfig?.model);
+    piSessionSyncedRef.current = false;
+    commands.piUpdateConfig(settings.user?.token ?? null, providerConfig).catch((e) => {
+      console.error("[Pi] Preset switch failed:", e);
+    });
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [settings.user?.token]);
 
   // Listen for Pi events (all providers route through Pi) and pipe events
   useEffect(() => {
@@ -1736,9 +1778,9 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
           console.error("[Pi] Auto-retry failed:", errorStr);
 
           // Detect rate limit or daily limit from the error
-          if (errorStr.includes("daily_limit_exceeded") || errorStr.includes("429") || errorStr.includes("rate limit")) {
+          if (errorStr.includes("daily_limit_exceeded") || errorStr.includes("daily_cost_limit_exceeded") || errorStr.includes("429") || errorStr.includes("rate limit")) {
             // Distinguish between daily limit and per-minute rate limit
-            const isDailyLimit = errorStr.includes("daily_limit_exceeded");
+            const isDailyLimit = errorStr.includes("daily_limit_exceeded") || errorStr.includes("daily_cost_limit_exceeded");
             const isPerMinuteRate = errorStr.includes("rate limit exceeded") || errorStr.includes("requests per minute");
 
             // Extract reset time if available
@@ -1751,6 +1793,7 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
 
             if (isDailyLimit) {
               setUpgradeReason("daily_limit");
+              setUpgradeTier(extractTierFromError(errorStr));
               posthog.capture("wall_hit", { reason: "daily_limit", source: "chat" });
             } else {
               setUpgradeReason("rate_limit");
@@ -1760,7 +1803,7 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
               const msgId = piMessageIdRef.current;
               let content: string;
               if (isDailyLimit) {
-                content = "You've used all your free queries for today.";
+                content = buildDailyLimitMessage(errorStr);
               } else if (isPerMinuteRate) {
                 // Extract wait time from error
                 const waitMatch = errorStr.match(/wait (\d+) seconds/i);
@@ -1793,8 +1836,8 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
             const msgId = piMessageIdRef.current;
             const fullError = `${reason} ${errorDetail}`.trim();
 
-            if (fullError.includes("daily_limit_exceeded") || fullError.includes("429") || fullError.includes("rate limit")) {
-              const isDailyLimit = fullError.includes("daily_limit_exceeded");
+            if (fullError.includes("daily_limit_exceeded") || fullError.includes("daily_cost_limit_exceeded") || fullError.includes("429") || fullError.includes("rate limit")) {
+              const isDailyLimit = fullError.includes("daily_limit_exceeded") || fullError.includes("daily_cost_limit_exceeded");
               const isPerMinuteRate = fullError.includes("rate limit exceeded") || fullError.includes("requests per minute");
               if (isDailyLimit) {
                 try {
@@ -1802,8 +1845,9 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
                   if (match) setUpgradeResetsAt(match[1]);
                 } catch {}
                 setUpgradeReason("daily_limit");
+                setUpgradeTier(extractTierFromError(fullError));
                 setMessages((prev) =>
-                  prev.map((m) => m.id === msgId ? { ...m, content: "You've used all your free queries for today." } : m)
+                  prev.map((m) => m.id === msgId ? { ...m, content: buildDailyLimitMessage(fullError) } : m)
                 );
               } else {
                 setUpgradeReason("rate_limit");
@@ -1840,15 +1884,16 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
           if (piMessageIdRef.current) {
             const msgId = piMessageIdRef.current;
 
-            if (errMsg.includes("credits_exhausted") || errMsg.includes("daily_limit_exceeded") || errMsg.includes("429")) {
+            if (errMsg.includes("credits_exhausted") || errMsg.includes("daily_limit_exceeded") || errMsg.includes("daily_cost_limit_exceeded") || errMsg.includes("429")) {
               try {
                 const resetsAtMatch = errMsg.match(/"resets_at":\s*"([^"]+)"/);
                 if (resetsAtMatch) setUpgradeResetsAt(resetsAtMatch[1]);
               } catch {}
               setUpgradeReason("daily_limit");
+              setUpgradeTier(extractTierFromError(errMsg));
               posthog.capture("wall_hit", { reason: "daily_limit", source: "chat" });
               setMessages((prev) =>
-                prev.map((m) => m.id === msgId ? { ...m, content: "You've used all your free queries for today." } : m)
+                prev.map((m) => m.id === msgId ? { ...m, content: buildDailyLimitMessage(errMsg) } : m)
               );
             } else if (errMsg.includes("rate limit") || errMsg.includes("rate_limit")) {
               setUpgradeReason("rate_limit");
@@ -1898,13 +1943,14 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
             // Surface credits_exhausted / rate limit errors from agent_end
             if (agentEndError && !content) {
               const errStr = agentEndError;
-              if (errStr.includes("credits_exhausted") || errStr.includes("daily_limit_exceeded") || errStr.includes("429")) {
+              if (errStr.includes("credits_exhausted") || errStr.includes("daily_limit_exceeded") || errStr.includes("daily_cost_limit_exceeded") || errStr.includes("429")) {
                 try {
                   const resetsAtMatch = errStr.match(/"resets_at":\s*"([^"]+)"/);
                   if (resetsAtMatch) setUpgradeResetsAt(resetsAtMatch[1]);
                 } catch {}
                 setUpgradeReason("daily_limit");
-                content = "You've used all your free queries for today.";
+                setUpgradeTier(extractTierFromError(errStr));
+                content = buildDailyLimitMessage(errStr);
               } else if (errStr.includes("rate limit")) {
                 setUpgradeReason("rate_limit");
                 content = "Rate limited — try again in a moment.";
@@ -1922,7 +1968,10 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
             setMessages((prev) => {
               const existing = prev.find((m) => m.id === msgId);
               // Don't overwrite error messages with "Done" or empty content
-              const isErrorMessage = existing?.content?.includes("used all your free queries") ||
+              const isErrorMessage = existing?.content?.includes("daily") && existing?.content?.includes("limit") ||
+                existing?.content?.includes("free queries") ||
+                existing?.content?.includes("daily Pro limit") ||
+                existing?.content?.includes("daily query limit") ||
                 existing?.content?.includes("requires an upgrade") ||
                 existing?.content?.includes("Rate limited") ||
                 existing?.content?.includes("rate limit") ||
@@ -1975,11 +2024,25 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
           }
         } else if (data.type === "response" && data.success === false) {
           const errorStr = data.error || "Unknown error";
+          // Pi agent first-call bug (pi-mono#2461) — first RPC prompt crashes.
+          // Auto-retry the same prompt once. The second call works.
+          if (errorStr.includes("startsWith") || errorStr.includes("text.startsWith")) {
+            console.warn("[Pi] first-call bug hit, auto-retrying prompt:", errorStr);
+            if (piMessageIdRef.current && !piFirstCallRetried.current) {
+              piFirstCallRetried.current = true;
+              // Re-send the last prompt
+              const lastUserMsg = messages.findLast(m => m.role === "user");
+              if (lastUserMsg?.content) {
+                commands.piPrompt(PI_CHAT_SESSION, lastUserMsg.content, null).catch(() => {});
+              }
+            }
+            return;
+          }
           if (piMessageIdRef.current) {
             const msgId = piMessageIdRef.current;
 
-            if (errorStr.includes("daily_limit_exceeded") || errorStr.includes("429") || errorStr.includes("rate limit")) {
-              const isDailyLimit = errorStr.includes("daily_limit_exceeded");
+            if (errorStr.includes("daily_limit_exceeded") || errorStr.includes("daily_cost_limit_exceeded") || errorStr.includes("429") || errorStr.includes("rate limit")) {
+              const isDailyLimit = errorStr.includes("daily_limit_exceeded") || errorStr.includes("daily_cost_limit_exceeded");
               const isPerMinuteRate = errorStr.includes("rate limit exceeded") || errorStr.includes("requests per minute");
               if (isDailyLimit) {
                 try {
@@ -1987,8 +2050,9 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
                   if (match) setUpgradeResetsAt(match[1]);
                 } catch {}
                 setUpgradeReason("daily_limit");
+                setUpgradeTier(extractTierFromError(errorStr));
                 setMessages((prev) =>
-                  prev.map((m) => m.id === msgId ? { ...m, content: "You've used all your free queries for today." } : m)
+                  prev.map((m) => m.id === msgId ? { ...m, content: buildDailyLimitMessage(errorStr) } : m)
                 );
               } else {
                 setUpgradeReason("rate_limit");
@@ -2455,11 +2519,11 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
             piRunningConfigRef.current = { provider: providerConfig.provider, model: providerConfig.model, token: settings.user?.token ?? null };
           }
         } else {
-          toast({ title: "Failed to start Pi", description: result.status === "error" ? result.error : "Unknown error", variant: "destructive" });
+          toast({ title: "Failed to start Screenpipe Cloud", description: result.status === "error" ? result.error : "Unknown error", variant: "destructive" });
           return;
         }
       } catch (e) {
-        toast({ title: "Failed to start Pi", description: String(e), variant: "destructive" });
+        toast({ title: "Failed to start Screenpipe Cloud", description: String(e), variant: "destructive" });
         return;
       } finally {
         setPiStarting(false);
@@ -2794,7 +2858,7 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
   };
 
   return (
-    <div className={cn("flex flex-col bg-background", className ?? "h-screen")}>
+    <div className={cn("flex flex-col bg-background", className ?? "h-screen")} data-testid="section-home">
       {/* Header - draggable only in standalone mode */}
       {/* Add left padding on macOS to avoid traffic light overlap (standalone only) */}
       <div
@@ -2847,30 +2911,9 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
           size="sm"
           onClick={async (e) => {
             e.stopPropagation();
-            // Kill Pi process if busy, then restart fresh
-            if (piInfo?.running && (isLoading || isStreaming)) {
-              piStoppedIntentionallyRef.current = true;
-              try { await commands.piStop(PI_CHAT_SESSION); } catch {}
-              piStreamingTextRef.current = "";
-              piMessageIdRef.current = null;
-              piContentBlocksRef.current = [];
-              setIsLoading(false);
-              setIsStreaming(false);
-              // Restart Pi fresh
-              try {
-                const providerConfig = buildProviderConfig();
-                const home = await homeDir();
-                const dir = await join(home, ".screenpipe", "pi-chat");
-                const result = await commands.piStart(PI_CHAT_SESSION, dir, settings.user?.token ?? null, providerConfig);
-                if (result.status === "ok") {
-                  setPiInfo(result.data);
-                  piSessionSyncedRef.current = true;
-                }
-              } catch (err) {
-                console.warn("[Pi] Failed to restart after new chat:", err);
-              }
-            }
-            startNewConversation();
+            piStoppedIntentionallyRef.current = true;
+            await startNewConversation();
+            // Pi will auto-restart on the next message via the sendPiMessage flow
           }}
           className="h-7 px-3 gap-1.5 text-xs bg-foreground text-background hover:bg-background hover:text-foreground transition-colors duration-150"
           title="New chat"
@@ -3116,9 +3159,13 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
                 )}
               >
                 <MessageContent message={message} onImageClick={(images, index) => setImageViewer({ images, index })} />
-                {/* Upgrade button for daily limit errors */}
+                {/* Upgrade button for daily limit errors (not shown for free model suggestions) */}
                 {message.role === "assistant" &&
-                 (message.content.includes("used all your free queries") ||
+                 !message.content.includes("Switch to a free model") &&
+                 !message.content.includes("temporarily overloaded") &&
+                 (message.content.includes("free queries") ||
+                  message.content.includes("daily Pro limit") ||
+                  message.content.includes("daily query limit") ||
                   message.content.includes("requires an upgrade")) && (
                   <button
                     onClick={() => setShowUpgradeDialog(true)}
@@ -3564,6 +3611,7 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
           <div className="flex-1 min-w-0">
             <AIPresetsSelector
               onPresetChange={setActivePreset}
+              onPresetSaved={handlePiRestart}
               controlledPresetId={activePipeExecution ? activePreset?.id : undefined}
               onControlledSelect={activePipeExecution ? (id) => {
                 const match = settings.aiPresets?.find((p) => p.id === id);
@@ -3724,6 +3772,7 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
         reason={upgradeReason}
         resetsAt={upgradeResetsAt}
         source="chat"
+        gatewayTier={upgradeTier}
       />
 
       {scheduleDialogMessage && (

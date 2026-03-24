@@ -5,6 +5,7 @@
 import { useState, useEffect, useMemo, useCallback, useRef } from "react";
 import { open as openUrl } from "@tauri-apps/plugin-shell";
 import { fetch as tauriFetch } from "@tauri-apps/plugin-http";
+import { homeDir, join } from "@tauri-apps/api/path";
 import { Button } from "../ui/button";
 import {
   DEFAULT_PROMPT,
@@ -24,6 +25,8 @@ import {
   RefreshCw,
   Settings2,
   Trash2,
+  Copy,
+  Star,
   XIcon,
   CheckCircle2,
   AlertCircle,
@@ -32,7 +35,25 @@ import {
   XCircle,
   ChevronDown,
   ChevronUp,
+  GripVertical,
 } from "lucide-react";
+import {
+  DndContext,
+  closestCenter,
+  KeyboardSensor,
+  PointerSensor,
+  useSensor,
+  useSensors,
+  type DragEndEvent,
+} from "@dnd-kit/core";
+import {
+  arrayMove,
+  SortableContext,
+  sortableKeyboardCoordinates,
+  useSortable,
+  rectSortingStrategy,
+} from "@dnd-kit/sortable";
+import { CSS } from "@dnd-kit/utilities";
 import { Textarea } from "../ui/textarea";
 import {
   Tooltip,
@@ -52,7 +73,7 @@ import {
 import { Badge } from "../ui/badge";
 import { toast } from "../ui/use-toast";
 import { Card, CardContent } from "../ui/card";
-import { AIProviderType } from "@screenpipe/browser";
+import { AIProviderType } from "@/lib/hooks/use-settings";
 import { useIsEnterpriseBuild } from "@/lib/hooks/use-is-enterprise-build";
 import {
   AlertDialog,
@@ -130,6 +151,13 @@ export interface AIModel {
   id: string;
   name: string;
   provider: string;
+  description?: string;
+  tags?: string[];
+  free?: boolean;
+  context_window?: number;
+  best_for?: string[];
+  speed?: string;
+  intelligence?: string;
 }
 
 export const AIProviderCard = ({
@@ -147,7 +175,7 @@ export const AIProviderCard = ({
     <Card
       onClick={onClick}
       className={cn(
-        "flex py-4 px-4 rounded-lg hover:bg-accent transition-colors h-[145px] w-full cursor-pointer",
+        "flex py-3 px-4 rounded-lg hover:bg-accent transition-colors h-[110px] w-full cursor-pointer",
         selected ? "border-black/60 border-[1.5px]" : "",
         disabled && "opacity-50 cursor-not-allowed",
       )}
@@ -188,6 +216,7 @@ const AISection = ({
   piAvailable?: boolean;
 }) => {
   const { settings, updateSettings } = useSettings();
+  const isEnterprise = useIsEnterpriseBuild();
   const [settingsPreset, setSettingsPreset] = useState<
     Partial<AIPreset> | undefined
   >(preset);
@@ -201,16 +230,22 @@ const AISection = ({
   const [chatgptLoggedIn, setChatgptLoggedIn] = useState(false);
   const [chatgptLoading, setChatgptLoading] = useState(false);
 
+  // Filter presets the same way the UI does so hidden presets don't block creation
+  const visiblePresets = useMemo(
+    () => settings.aiPresets.filter((p) => !isEnterprise || p.provider !== "pi"),
+    [settings.aiPresets, isEnterprise]
+  );
+
   // Optimized validation with debouncing
   const debouncedValidatePreset = useMemo(
     () => debounce((presetData: Partial<AIPreset>) => {
       const errors: Record<string, string> = {};
-      
+
       // Validate name
       if (presetData.id) {
         const nameValidation = validatePresetName(
-          presetData.id, 
-          settings.aiPresets, 
+          presetData.id,
+          visiblePresets,
           preset?.id
         );
         if (!nameValidation.isValid && nameValidation.error) {
@@ -256,6 +291,7 @@ const AISection = ({
       });
     }
   }, [settingsPreset?.provider]);
+
 
   const isFormValid = useMemo(() => {
     return Object.keys(validationErrors).length === 0 && 
@@ -338,8 +374,14 @@ const AISection = ({
           defaultPreset: false,
         } as AIPreset;
 
+        // Remove any hidden preset with the same name (e.g. filtered Pi preset
+        // in enterprise builds) so it doesn't ghost-block future operations
+        const cleanedPresets = settings.aiPresets.filter(
+          (p) => p.id.toLowerCase() !== newPreset.id.toLowerCase()
+        );
+
         await updateSettings({
-          aiPresets: [...settings.aiPresets, newPreset],
+          aiPresets: [...cleanedPresets, newPreset],
         });
 
         toast({
@@ -433,8 +475,12 @@ const AISection = ({
         newModel = "gpt-5.4";
         break;
       case "anthropic":
+        newUrl = "";
+        newModel = "claude-sonnet-4-6";
+        break;
+      case "anthropic":
         newUrl = "https://api.anthropic.com";
-        newModel = "claude-sonnet-4-5-20250514";
+        newModel = "claude-sonnet-4-6";
         break;
       case "pi":
         newUrl = ""; // Pi uses RPC mode, not HTTP
@@ -731,6 +777,7 @@ const AISection = ({
 
   const isApiKeyRequired =
     settingsPreset?.provider !== "openai-chatgpt" &&
+    settingsPreset?.provider !== "anthropic" &&
     settingsPreset?.url !== "https://api.screenpi.pe/v1" &&
     settingsPreset?.url !== "http://localhost:11434/v1" &&
     settingsPreset?.url !== "embedded";
@@ -830,18 +877,28 @@ const AISection = ({
             } else {
               // Fallback to hardcoded models
               setModels([
-                { id: "claude-opus-4-6-20250828", name: "Claude Opus 4.6", provider: "anthropic" },
-                { id: "claude-sonnet-4-5-20250514", name: "Claude Sonnet 4.5", provider: "anthropic" },
+                { id: "claude-opus-4-6", name: "Claude Opus 4.6", provider: "anthropic" },
+                { id: "claude-sonnet-4-6", name: "Claude Sonnet 4.5", provider: "anthropic" },
                 { id: "claude-haiku-4-5-20251001", name: "Claude Haiku 4.5", provider: "anthropic" },
               ]);
             }
           } catch {
             setModels([
-              { id: "claude-opus-4-6-20250828", name: "Claude Opus 4.6", provider: "anthropic" },
-              { id: "claude-sonnet-4-5-20250514", name: "Claude Sonnet 4.5", provider: "anthropic" },
+              { id: "claude-opus-4-6", name: "Claude Opus 4.6", provider: "anthropic" },
+              { id: "claude-sonnet-4-6", name: "Claude Sonnet 4.5", provider: "anthropic" },
               { id: "claude-haiku-4-5-20251001", name: "Claude Haiku 4.5", provider: "anthropic" },
             ]);
           }
+          break;
+        }
+
+        case "anthropic": {
+          // Hardcoded model list — Claude Pro/Max subscription models
+          setModels([
+            { id: "claude-opus-4-6", name: "Claude Opus 4.6", provider: "anthropic" },
+            { id: "claude-sonnet-4-6", name: "Claude Sonnet 4.5", provider: "anthropic" },
+            { id: "claude-haiku-4-5-20251001", name: "Claude Haiku 4.5", provider: "anthropic" },
+          ]);
           break;
         }
 
@@ -890,14 +947,44 @@ const AISection = ({
         }
 
         case "pi": {
-          const piModels: AIModel[] = [
+          // Fetch models from gateway so new models appear automatically
+          try {
+            const token = settings.user?.token || "";
+            const piResp = await fetch("https://api.screenpi.pe/v1/models", {
+              headers: token ? { Authorization: `Bearer ${token}` } : {},
+            });
+            if (piResp.ok) {
+              const piData = await piResp.json();
+              const piModels: AIModel[] = (piData.data || []).map((m: any) => ({
+                id: m.id,
+                name: m.name || m.id,
+                provider: "screenpipe",
+                description: m.description,
+                tags: m.tags,
+                free: m.free,
+                context_window: m.context_window,
+                best_for: m.best_for,
+                speed: m.speed,
+                intelligence: m.intelligence,
+              }));
+              if (piModels.length > 0) {
+                setModels(piModels);
+                break;
+              }
+            }
+          } catch {
+            // fallback to hardcoded
+          }
+          setModels([
             { id: "claude-haiku-4-5", name: "Haiku 4.5 (fast)", provider: "screenpipe" },
             { id: "claude-sonnet-4-5", name: "Sonnet 4.5 (balanced)", provider: "screenpipe" },
             { id: "claude-opus-4-6", name: "Opus 4.6 (powerful, pro)", provider: "screenpipe" },
             { id: "gemini-3-flash", name: "Gemini 3 Flash (fast)", provider: "screenpipe" },
             { id: "gemini-3.1-pro", name: "Gemini 3.1 Pro (balanced)", provider: "screenpipe" },
-          ];
-          setModels(piModels);
+            { id: "qwen/qwen3.5-flash-02-23", name: "Qwen3.5 Flash (cheapest, 1M ctx)", provider: "screenpipe" },
+            { id: "deepseek/deepseek-chat", name: "DeepSeek V3.2 (fast)", provider: "screenpipe" },
+            { id: "meta-llama/llama-4-scout", name: "Llama 4 Scout", provider: "screenpipe" },
+          ]);
           break;
         }
 
@@ -960,7 +1047,7 @@ const AISection = ({
   }, []);
 
   return (
-    <div className="w-full space-y-6 py-4">
+    <div className="w-full space-y-4 py-3">
       <div className="flex flex-col gap-2">
         <Button
           className="w-max flex gap-2"
@@ -969,7 +1056,7 @@ const AISection = ({
         >
           <ArrowLeft className="w-4 h-4" /> back
         </Button>
-        <h1 className="text-2xl font-bold">
+        <h1 className="text-xl font-semibold">
           {preset ? "Update preset" : "Create preset"}
         </h1>
       </div>
@@ -992,11 +1079,15 @@ const AISection = ({
 
           <AIProviderCard
             type="anthropic"
-            title="Anthropic"
-            description="Use your Anthropic API key for Claude models"
-            imageSrc="/images/anthropic.png"
-            selected={settingsPreset?.provider === "anthropic"}
-            onClick={() => handleAiProviderChange("anthropic")}
+            title="Claude.ai"
+            description="Use your Claude Pro/Max subscription or Anthropic API key"
+            imageSrc="/images/claude-ai.svg"
+            selected={(settingsPreset?.provider as string) === "anthropic"}
+            onClick={() => {
+              if ((settingsPreset?.provider as string) !== "anthropic") {
+                handleAiProviderChange("anthropic");
+              }
+            }}
           />
 
           <AIProviderCard
@@ -1038,7 +1129,7 @@ const AISection = ({
         label="Preset Name"
         value={settingsPreset?.id || ""}
         onChange={(value, isValid) => updateSettingsPreset({ id: value })}
-        validation={(value) => validatePresetName(value, settings.aiPresets, preset?.id)}
+        validation={(value) => validatePresetName(value, visiblePresets, preset?.id)}
         placeholder="Enter preset name"
         required={true}
         disabled={!!preset && !isDuplicating && preset.id !== undefined}
@@ -1057,6 +1148,7 @@ const AISection = ({
           helperText="Enter the base URL for your custom AI provider"
         />
       )}
+
 
       {(settingsPreset?.provider === "anthropic" || settingsPreset?.provider === "custom" || (isApiKeyRequired &&
         settingsPreset?.provider === "openai")) && (
@@ -1203,49 +1295,81 @@ const AISection = ({
                   <CommandEmpty>
                     Press enter to use &quot;{settingsPreset?.model}&quot;
                   </CommandEmpty>
-                  <CommandGroup heading="Available Models">
-                    {isLoadingModels ? (
+                  {isLoadingModels ? (
+                    <CommandGroup>
                       <CommandItem value="loading" disabled>
                         <Loader2 className="mr-2 h-4 w-4 animate-spin" />
                         Loading models...
                       </CommandItem>
-                    ) : (
-                      models?.map((model) => (
-                        <CommandItem
-                          key={model.id}
-                          value={model.id}
-                          onSelect={async () => {
-                            if (model.id === "claude-opus-4-6" && !settings.user?.cloud_subscribed) {
-                              if (!settings.user?.token) {
-                                await commands.openLoginWindow();
-                              } else {
-                                try {
-                                  const res = await fetch("https://screenpi.pe/api/cloud-sync/checkout", {
-                                    method: "POST",
-                                    headers: { "Content-Type": "application/json", "Authorization": `Bearer ${settings.user.token}` },
-                                    body: JSON.stringify({ tier: "pro", billingPeriod: "monthly", userId: settings.user.id, email: settings.user.email }),
-                                  });
-                                  const data = await res.json();
-                                  if (data.url) await openUrl(data.url);
-                                } catch (e) {
-                                  console.error("checkout failed:", e);
+                    </CommandGroup>
+                  ) : (
+                    <>
+                      {models?.some((m) => m.free) && (
+                        <CommandGroup heading="Free">
+                          {models.filter((m) => m.free).map((model) => (
+                            <CommandItem
+                              key={model.id}
+                              value={model.id}
+                              onSelect={() => updateSettingsPreset({ model: model.id })}
+                            >
+                              <div className="flex flex-col gap-0.5 w-full">
+                                <div className="flex items-center justify-between">
+                                  <span className="font-medium">{model.name}</span>
+                                  <Badge variant="outline" className="ml-2 text-[10px] bg-green-500/10 text-green-600 border-green-500/30">free</Badge>
+                                </div>
+                                {model.description && (
+                                  <span className="text-xs text-muted-foreground">{model.description}{model.context_window ? ` · ${Math.round(model.context_window / 1000)}K ctx` : ""}</span>
+                                )}
+                              </div>
+                            </CommandItem>
+                          ))}
+                        </CommandGroup>
+                      )}
+                      <CommandGroup heading={models?.some((m) => m.free) ? "Included with Screenpipe" : "Available Models"}>
+                        {models?.filter((m) => !m.free).map((model) => (
+                          <CommandItem
+                            key={model.id}
+                            value={model.id}
+                            onSelect={async () => {
+                              if (model.id === "claude-opus-4-6" && !settings.user?.cloud_subscribed) {
+                                if (!settings.user?.token) {
+                                  await commands.openLoginWindow();
+                                } else {
+                                  try {
+                                    const res = await fetch("https://screenpi.pe/api/cloud-sync/checkout", {
+                                      method: "POST",
+                                      headers: { "Content-Type": "application/json", "Authorization": `Bearer ${settings.user.token}` },
+                                      body: JSON.stringify({ tier: "pro", billingPeriod: "monthly", userId: settings.user.id, email: settings.user.email }),
+                                    });
+                                    const data = await res.json();
+                                    if (data.url) await openUrl(data.url);
+                                  } catch (e) {
+                                    console.error("checkout failed:", e);
+                                  }
                                 }
+                                return;
                               }
-                              return;
-                            }
-                            updateSettingsPreset({ model: model.id });
-                          }}
-                        >
-                          <div className="flex items-center justify-between w-full">
-                            <span>{model.name}</span>
-                            <Badge variant="outline" className="ml-2">
-                              {model.provider}
-                            </Badge>
-                          </div>
-                        </CommandItem>
-                      ))
-                    )}
-                  </CommandGroup>
+                              updateSettingsPreset({ model: model.id });
+                            }}
+                          >
+                            <div className="flex flex-col gap-0.5 w-full">
+                              <div className="flex items-center justify-between">
+                                <span className="font-medium">{model.name}</span>
+                                <div className="flex items-center gap-1 ml-2">
+                                  {model.intelligence === "highest" && <Badge variant="outline" className="text-[10px]">smartest</Badge>}
+                                  {model.speed === "fast" && model.intelligence !== "highest" && <Badge variant="outline" className="text-[10px]">fast</Badge>}
+                                  {model.tags?.includes("reasoning") && model.intelligence !== "highest" && <Badge variant="outline" className="text-[10px]">reasoning</Badge>}
+                                </div>
+                              </div>
+                              {model.description && (
+                                <span className="text-xs text-muted-foreground">{model.description}{model.context_window ? ` · ${Math.round(model.context_window / 1000)}K ctx` : ""}</span>
+                              )}
+                            </div>
+                          </CommandItem>
+                        ))}
+                      </CommandGroup>
+                    </>
+                  )}
                 </CommandList>
               </Command>
             </PopoverContent>
@@ -1472,11 +1596,116 @@ const AISection = ({
 const providerImageSrc: Record<string, string> = {
   openai: "/images/openai.png",
   "openai-chatgpt": "/images/openai.png",
-  anthropic: "/images/anthropic.png",
+  anthropic: "/images/claude-ai.svg",
   "native-ollama": "/images/ollama.png",
   custom: "/images/custom.png",
   pi: "/images/screenpipe.png",
 };
+
+// Sortable preset card for drag-and-drop reordering
+function SortablePresetCard({
+  preset,
+  isDefault,
+  hasValidation,
+  onEdit,
+  onDuplicate,
+  onSetDefault,
+  onDelete,
+  isLoading,
+}: {
+  preset: AIPreset;
+  isDefault: boolean;
+  hasValidation: boolean;
+  onEdit: () => void;
+  onDuplicate: () => void;
+  onSetDefault: () => void;
+  onDelete: () => void;
+  isLoading: boolean;
+}) {
+  const {
+    attributes,
+    listeners,
+    setNodeRef,
+    transform,
+    transition,
+    isDragging,
+  } = useSortable({ id: preset.id });
+
+  const style = {
+    transform: CSS.Transform.toString(transform),
+    transition,
+    opacity: isDragging ? 0.5 : 1,
+    zIndex: isDragging ? 50 : undefined,
+  };
+
+  return (
+    <Card
+      ref={setNodeRef}
+      style={style}
+      className={cn(
+        "p-3 relative group transition-all hover:shadow-md border-border bg-card cursor-pointer",
+        isDefault && "ring-2 ring-primary/20",
+        isDragging && "shadow-lg"
+      )}
+      onClick={onEdit}
+    >
+      <div className="space-y-2">
+        <div className="flex justify-between items-center">
+          <div className="flex items-center gap-2 flex-1 min-w-0">
+            <button
+              className="cursor-grab active:cursor-grabbing touch-none text-muted-foreground hover:text-foreground shrink-0"
+              {...attributes}
+              {...listeners}
+              onClick={(e) => e.stopPropagation()}
+            >
+              <GripVertical className="w-4 h-4" />
+            </button>
+            {/* eslint-disable-next-line @next/next/no-img-element */}
+            <img
+              src={providerImageSrc[preset.provider]}
+              alt={`${preset.provider} logo`}
+              className="w-6 h-6 opacity-80 rounded shrink-0"
+            />
+            <h3 className="text-sm font-semibold text-foreground truncate" title={preset.id}>
+              {formatPresetName(preset.id)}
+            </h3>
+            {isDefault && (
+              <Badge variant="default" className="text-[10px] px-1.5 py-0">
+                default
+              </Badge>
+            )}
+            {!hasValidation && (
+              <AlertCircle className="h-3.5 w-3.5 text-destructive shrink-0" />
+            )}
+          </div>
+          {hasValidation ? (
+            <CheckCircle2 className="h-4 w-4 text-foreground/50 shrink-0" />
+          ) : (
+            <AlertCircle className="h-4 w-4 text-destructive shrink-0" />
+          )}
+        </div>
+        <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
+          <span className="font-mono bg-muted px-1.5 py-0.5 rounded truncate max-w-[180px]" title={preset.model || 'Not set'}>
+            {preset.model || 'Not set'}
+          </span>
+        </div>
+        <div className="flex items-center gap-0.5 pt-1.5 border-t border-border">
+          <Button variant="ghost" size="sm" className="text-[11px] h-6 px-2" onClick={(e) => { e.stopPropagation(); onDuplicate(); }} disabled={isLoading}>
+            <Copy className="w-3 h-3 mr-1" />duplicate
+          </Button>
+          <Button variant="ghost" size="sm" className="text-[11px] h-6 px-2" onClick={(e) => { e.stopPropagation(); onSetDefault(); }} disabled={isLoading || isDefault}>
+            <Star className="w-3 h-3 mr-1" />{isDefault ? "default" : "set default"}
+          </Button>
+          {!isDefault && (
+            <Button variant="ghost" size="sm" className="text-[11px] h-6 px-2 text-destructive hover:text-destructive ml-auto" onClick={(e) => { e.stopPropagation(); onDelete(); }} disabled={isLoading}>
+              <Trash2 className="w-3 h-3" />
+            </Button>
+          )}
+        </div>
+      </div>
+    </Card>
+  );
+}
 
 export const AIPresets = () => {
   const { settings, updateSettings } = useSettings();
@@ -1490,6 +1719,28 @@ export const AIPresets = () => {
   const [isDuplicating, setIsDuplicating] = useState(false);
   const isEnterprise = useIsEnterpriseBuild();
   const [piAvailable, setPiAvailable] = useState(false);
+
+  // Drag-and-drop sensors with activation distance to avoid conflicts with clicks
+  const sensors = useSensors(
+    useSensor(PointerSensor, { activationConstraint: { distance: 8 } }),
+    useSensor(KeyboardSensor, { coordinateGetter: sortableKeyboardCoordinates })
+  );
+
+  const handleDragEnd = useCallback(
+    (event: DragEndEvent) => {
+      const { active, over } = event;
+      if (!over || active.id === over.id) return;
+
+      const presets = settings.aiPresets;
+      const oldIndex = presets.findIndex((p) => p.id === active.id);
+      const newIndex = presets.findIndex((p) => p.id === over.id);
+      if (oldIndex === -1 || newIndex === -1) return;
+
+      const reordered = arrayMove(presets, oldIndex, newIndex);
+      updateSettings({ aiPresets: reordered });
+    },
+    [settings.aiPresets, updateSettings]
+  );
 
   // Check Pi availability (installed at app startup by Rust background thread)
   useEffect(() => {
@@ -1633,9 +1884,18 @@ export const AIPresets = () => {
     const presetToDuplicate = settings.aiPresets.find((p) => p.id === id);
     if (!presetToDuplicate) return;
 
+    // Find a unique name by appending a number
+    const baseName = presetToDuplicate.id.replace(/ \d+$/, "");
+    let counter = 2;
+    let newName = `${baseName} ${counter}`;
+    while (settings.aiPresets.some((p) => p.id.toLowerCase() === newName.toLowerCase())) {
+      counter++;
+      newName = `${baseName} ${counter}`;
+    }
+
     const newPreset = {
       ...presetToDuplicate,
-      id: `${presetToDuplicate.id} copy`,
+      id: newName,
       defaultPreset: false,
     };
 
@@ -1693,125 +1953,32 @@ export const AIPresets = () => {
         </Button>
       </div>
 
-      <div className="w-full grid grid-cols-1 md:grid-cols-2 gap-6">
-        {settings.aiPresets.filter((preset) => !isEnterprise || preset.provider !== "pi").map((preset) => {
-          const isDefault = preset.defaultPreset;
-          const hasValidation = preset.provider && preset.model && preset.url;
-          
-          return (
-            <Card
-              key={preset.id}
-              className={cn(
-                "p-6 relative group transition-all hover:shadow-lg border-border bg-card cursor-pointer",
-                isDefault && "ring-2 ring-primary/20"
-              )}
-              onClick={() => {
-                setSelectedPreset(preset);
-                setIsDuplicating(false);
-                setCreatePresentDialog(true);
-              }}
-            >
-              <div className="space-y-4">
-                <div className="flex justify-between items-start">
-                  <div className="space-y-2 flex-1">
-                    <div className="flex items-center gap-2">
-                      <h3 className="text-lg font-semibold text-foreground truncate" title={preset.id}>
-                        {formatPresetName(preset.id)}
-                      </h3>
-                      {isDefault && (
-                        <Badge variant="default" className="text-xs">
-                          default
-                        </Badge>
-                      )}
-                      {!hasValidation && (
-                        <AlertCircle className="h-4 w-4 text-destructive" />
-                      )}
-                    </div>
-                    
-                    <div className="space-y-1 text-sm text-muted-foreground">
-                      <div className="flex items-center gap-2">
-                        <span className="font-medium">Provider:</span>
-                        <span className="capitalize">{preset.provider.replace('-', ' ')}</span>
-                      </div>
-                      <div className="flex items-center gap-2">
-                        <span className="font-medium">Model:</span>
-                        <span className="font-mono text-xs bg-muted px-2 py-1 rounded">
-                          {preset.model || 'Not set'}
-                        </span>
-                      </div>
-                    </div>
-                  </div>
-
-                  <div className="flex items-start gap-2">
-                    {/* eslint-disable-next-line @next/next/no-img-element */}
-                    <img
-                      src={providerImageSrc[preset.provider]}
-                      alt={`${preset.provider} logo`}
-                      className="w-10 h-10 opacity-80 group-hover:opacity-100 transition-opacity rounded"
-                    />
-                    {hasValidation ? (
-                      <CheckCircle2 className="h-5 w-5 text-foreground/70" />
-                    ) : (
-                      <TooltipProvider>
-                        <Tooltip>
-                          <TooltipTrigger>
-                            <AlertCircle className="h-5 w-5 text-destructive" />
-                          </TooltipTrigger>
-                          <TooltipContent>
-                            <p>Configuration incomplete</p>
-                          </TooltipContent>
-                        </Tooltip>
-                      </TooltipProvider>
-                    )}
-                  </div>
-                </div>
-
-                <div className="flex flex-wrap gap-1 items-center pt-2 border-t border-border">
-                    <Button
-                      variant="ghost"
-                      size="sm"
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        duplicatePreset(preset.id);
-                      }}
-                      disabled={isLoading}
-                      className="text-xs"
-                    >
-                      Duplicate
-                    </Button>
-
-                    <Button
-                      variant="ghost"
-                      size="sm"
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        setPresetToSetDefault(preset.id);
-                      }}
-                      disabled={isLoading || isDefault}
-                      className="text-xs"
-                    >
-                      {isDefault ? "Current default" : "Set as default"}
-                    </Button>
-
-                  <Button
-                    variant="ghost"
-                    size="sm"
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      setPresetToDelete(preset.id);
-                    }}
-                    disabled={isLoading || isDefault}
-                    className="text-xs text-destructive hover:text-destructive ml-auto"
-                  >
-                    <Trash2 className="w-3 h-3 mr-1" />
-                    Remove
-                  </Button>
-                </div>
-              </div>
-            </Card>
-          );
-        })}
-      </div>
+      <DndContext sensors={sensors} collisionDetection={closestCenter} onDragEnd={handleDragEnd}>
+        <SortableContext
+          items={settings.aiPresets.filter((preset) => !isEnterprise || preset.provider !== "pi").map((p) => p.id)}
+          strategy={rectSortingStrategy}
+        >
+          <div className="w-full grid grid-cols-1 md:grid-cols-2 gap-3">
+            {settings.aiPresets.filter((preset) => !isEnterprise || preset.provider !== "pi").map((preset) => (
+              <SortablePresetCard
+                key={preset.id}
+                preset={preset}
+                isDefault={preset.defaultPreset}
+                hasValidation={!!(preset.provider && preset.model && preset.url)}
+                onEdit={() => {
+                  setSelectedPreset(preset);
+                  setIsDuplicating(false);
+                  setCreatePresentDialog(true);
+                }}
+                onDuplicate={() => duplicatePreset(preset.id)}
+                onSetDefault={() => setPresetToSetDefault(preset.id)}
+                onDelete={() => setPresetToDelete(preset.id)}
+                isLoading={isLoading}
+              />
+            ))}
+          </div>
+        </SortableContext>
+      </DndContext>
 
       <AlertDialog
         open={!!presetToDelete}

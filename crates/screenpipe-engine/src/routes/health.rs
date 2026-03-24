@@ -13,7 +13,6 @@ use std::sync::{
     atomic::{AtomicU64, Ordering},
     Arc,
 };
-use std::time::Duration;
 use tokio::sync::RwLock;
 use tracing::{debug, warn};
 
@@ -71,6 +70,9 @@ pub struct HealthCheckResponse {
     /// True when audio devices are active but DB writes have stopped (pool exhaustion).
     #[serde(default)]
     pub audio_db_write_stalled: bool,
+    /// True when DRM streaming content is detected and capture should be fully stopped.
+    #[serde(default)]
+    pub drm_content_paused: bool,
 }
 
 #[derive(Serialize, OaSchema, Deserialize, Clone)]
@@ -561,22 +563,10 @@ async fn health_check_inner(state: &Arc<AppState>) -> HealthCheckResponse {
             let (meeting_detected, meeting_app) =
                 if let Some(detector) = state.audio_manager.meeting_detector() {
                     let in_meeting = detector.is_in_meeting();
-                    let app = if in_meeting {
-                        match tokio::time::timeout(
-                            Duration::from_millis(500),
-                            detector.current_meeting_app(),
-                        )
-                        .await
-                        {
-                            Ok(app) => app,
-                            Err(_) => {
-                                warn!("health_check: meeting_detector lock timed out after 500ms");
-                                None
-                            }
-                        }
-                    } else {
-                        None
-                    };
+                    // v2 detection reports meeting state via AtomicBool flag;
+                    // the specific app name is tracked in the v2 detection loop,
+                    // not exposed through MeetingDetector.
+                    let app: Option<String> = None;
                     (Some(in_meeting), app)
                 } else {
                     (None, None)
@@ -645,6 +635,7 @@ async fn health_check_inner(state: &Arc<AppState>) -> HealthCheckResponse {
         },
         vision_db_write_stalled,
         audio_db_write_stalled,
+        drm_content_paused: crate::drm_detector::drm_content_paused(),
     }
 }
 
@@ -771,6 +762,7 @@ mod tests {
             pool_stats: None,
             vision_db_write_stalled: false,
             audio_db_write_stalled: false,
+            drm_content_paused: false,
         }
     }
 

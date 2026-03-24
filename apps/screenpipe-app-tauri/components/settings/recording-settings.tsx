@@ -636,6 +636,10 @@ export function RecordingSettings() {
     const checkPlatform = async () => {
       const currentPlatform = platform();
       setIsMacOS(currentPlatform === "macos");
+      // Auto-migrate macOS users off qwen3-asr (CPU-only, no Metal support)
+      if (currentPlatform === "macos" && settings.audioTranscriptionEngine === "qwen3-asr") {
+        handleSettingsChange({ audioTranscriptionEngine: "whisper-large-v3-turbo-quantized" }, true);
+      }
     };
     checkPlatform();
   }, []);
@@ -1303,7 +1307,7 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
                     <SelectItem value="whisper-large-v3-turbo-quantized">Whisper Turbo (fast)</SelectItem>
                     <SelectItem value="whisper-tiny">Whisper Tiny</SelectItem>
                     <SelectItem value="whisper-tiny-quantized">Whisper Tiny (fast)</SelectItem>
-                    <SelectItem value="qwen3-asr">Qwen3-ASR</SelectItem>
+                    {!isMacOS && <SelectItem value="qwen3-asr">Qwen3-ASR</SelectItem>}
                   </SelectGroup>
                   <SelectGroup>
                     <SelectLabel className="text-[10px] text-muted-foreground/70 uppercase tracking-wider">other</SelectLabel>
@@ -1585,7 +1589,7 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
                   <Slider
                     value={[settings.batchMaxDurationSecs ?? 0]}
                     onValueChange={([value]) =>
-                      handleSettingsChange({ batchMaxDurationSecs: value }, true)
+                      handleSettingsChange({ batchMaxDurationSecs: value ?? 0 } as any, true)
                     }
                     min={0}
                     max={1800}
@@ -1936,30 +1940,6 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
       {/* System */}
       <div className="space-y-2 pt-2">
         <h2 className="text-xs font-semibold text-muted-foreground uppercase tracking-wider px-1">System</h2>
-
-        <Card className="border-border bg-card">
-          <CardContent className="px-3 py-2.5">
-            <div className="flex items-center justify-between">
-              <div className="flex items-center space-x-2.5">
-                <Terminal className="h-4 w-4 text-muted-foreground shrink-0" />
-                <div>
-                  <h3 className="text-sm font-medium text-foreground">Server port</h3>
-                  <p className="text-xs text-muted-foreground">Requires restart</p>
-                </div>
-              </div>
-              <Input
-                id="port"
-                type="number"
-                value={settings.port}
-                onChange={(e) => {
-                  const portValue = parseInt(e.target.value) || 3030;
-                  handleSettingsChange({ port: portValue }, true);
-                }}
-                className="w-20 h-7 text-xs text-right"
-              />
-            </div>
-          </CardContent>
-        </Card>
 
         <Card className="border-border bg-card">
           <CardContent className="px-3 py-2.5">

@@ -223,10 +223,11 @@ impl ShowRewindWindow {
         overlay_mode: &str,
         label: &str,
     ) -> tauri::Result<WebviewWindow> {
-        let capturable = SettingsStore::get(app)
-            .unwrap_or_default()
-            .unwrap_or_default()
-            .show_overlay_in_screen_recording;
+        let capturable = crate::config::is_e2e_mode()
+            || SettingsStore::get(app)
+                .unwrap_or_default()
+                .unwrap_or_default()
+                .show_overlay_in_screen_recording;
 
         if overlay_mode == "window" {
             info!("showing existing main window (window mode)");
@@ -480,35 +481,38 @@ impl ShowRewindWindow {
 
                 #[cfg(target_os = "macos")]
                 {
-                    use objc::{msg_send, sel, sel_impl};
-                    use tauri_nspanel::cocoa::base::{id as cocoa_id, nil as cocoa_nil};
-                    if let Ok(ns_win) = window.ns_window() {
-                        unsafe {
-                            // Activate the app so it comes to the foreground
-                            let ns_app: cocoa_id =
-                                msg_send![objc::class!(NSApplication), sharedApplication];
-                            let _: () = msg_send![ns_app, activateIgnoringOtherApps: true];
+                    let window_clone = window.clone();
+                    run_on_main_thread_safe(app, move || {
+                        use objc::{msg_send, sel, sel_impl};
+                        use tauri_nspanel::cocoa::base::{id as cocoa_id, nil as cocoa_nil};
+                        if let Ok(ns_win) = window_clone.ns_window() {
+                            unsafe {
+                                // Activate the app so it comes to the foreground
+                                let ns_app: cocoa_id =
+                                    msg_send![objc::class!(NSApplication), sharedApplication];
+                                let _: () = msg_send![ns_app, activateIgnoringOtherApps: true];
 
-                            // Move the window to the active space (current workspace)
-                            // NSWindowCollectionBehaviorMoveToActiveSpace = 1 << 1 = 2
-                            let behavior: u64 = msg_send![ns_win as cocoa_id, collectionBehavior];
-                            let move_to_active: u64 = 1 << 1;
-                            let _: () = msg_send![ns_win as cocoa_id, setCollectionBehavior: behavior | move_to_active];
+                                // Move the window to the active space (current workspace)
+                                // NSWindowCollectionBehaviorMoveToActiveSpace = 1 << 1 = 2
+                                let behavior: u64 = msg_send![ns_win as cocoa_id, collectionBehavior];
+                                let move_to_active: u64 = 1 << 1;
+                                let _: () = msg_send![ns_win as cocoa_id, setCollectionBehavior: behavior | move_to_active];
 
-                            // Bring window to front and make it key
-                            let _: () =
-                                msg_send![ns_win as cocoa_id, makeKeyAndOrderFront: cocoa_nil];
+                                // Bring window to front and make it key
+                                let _: () =
+                                    msg_send![ns_win as cocoa_id, makeKeyAndOrderFront: cocoa_nil];
 
-                            // Set WKWebView as first responder so keyboard input works.
-                            // Without this, re-showing an existing Settings window may
-                            // leave the content_view as first responder (tao#208).
-                            make_nswindow_webview_first_responder(ns_win as cocoa_id);
+                                // Set WKWebView as first responder so keyboard input works.
+                                // Without this, re-showing an existing Settings window may
+                                // leave the content_view as first responder (tao#208).
+                                make_nswindow_webview_first_responder(ns_win as cocoa_id);
 
-                            // Remove MoveToActiveSpace so the window stays pinned to this space
-                            let _: () =
-                                msg_send![ns_win as cocoa_id, setCollectionBehavior: behavior];
+                                // Remove MoveToActiveSpace so the window stays pinned to this space
+                                let _: () =
+                                    msg_send![ns_win as cocoa_id, setCollectionBehavior: behavior];
+                            }
                         }
-                    }
+                    });
                 }
                 #[cfg(not(target_os = "macos"))]
                 {
@@ -531,7 +535,8 @@ impl ShowRewindWindow {
                     let settings = SettingsStore::get(app)
                         .unwrap_or_default()
                         .unwrap_or_default();
-                    let capturable = settings.show_overlay_in_screen_recording;
+                    let capturable = crate::config::is_e2e_mode()
+                        || settings.show_overlay_in_screen_recording;
                     let chat_on_top = settings.chat_always_on_top;
                     let app_clone = app.clone();
                     run_on_main_thread_safe(app, move || {
@@ -649,7 +654,8 @@ impl ShowRewindWindow {
                     .unwrap_or_default();
                 let overlay_mode = settings.overlay_mode;
                 #[allow(unused_variables)] // used only on macOS
-                let show_in_recording = settings.show_overlay_in_screen_recording;
+                let show_in_recording = crate::config::is_e2e_mode()
+                    || settings.show_overlay_in_screen_recording;
                 // Record what mode we're creating so we can detect changes later
                 *MAIN_CREATED_MODE.lock().unwrap_or_else(|e| e.into_inner()) = overlay_mode.clone();
                 let use_window_mode = overlay_mode == "window";
@@ -1420,13 +1426,14 @@ impl ShowRewindWindow {
                                     msg_send![&*panel, setMovableByWindowBackground: true]
                                 };
 
-                                // NSWindowSharingNone=0 hides from screen recorders, NSWindowSharingReadOnly=1 allows capture
-                                let capturable = SettingsStore::get(window_clone.app_handle())
+                            // NSWindowSharingNone=0 hides from screen recorders, NSWindowSharingReadOnly=1 allows capture
+                            let capturable = crate::config::is_e2e_mode()
+                                || SettingsStore::get(window_clone.app_handle())
                                     .unwrap_or_default()
                                     .unwrap_or_default()
                                     .show_overlay_in_screen_recording;
-                                let sharing: u64 = if capturable { 1 } else { 0 };
-                                let _: () = unsafe { msg_send![&*panel, setSharingType: sharing] };
+                            let sharing: u64 = if capturable { 1 } else { 0 };
+                            let _: () = unsafe { msg_send![&*panel, setSharingType: sharing] };
 
                                 // MoveToActiveSpace so show_existing can pull
                                 // it to any Space (including fullscreen).
@@ -1561,6 +1568,45 @@ impl ShowRewindWindow {
         };
 
         Ok(window)
+    }
+
+    /// Hide Main panel without restoring the previous frontmost app.
+    /// Used when transitioning from Main to another screenpipe window (e.g. Home/Settings)
+    /// so that focus stays with the app instead of bouncing to the previous app.
+    pub fn hide_without_restore(&self, app: &AppHandle) -> tauri::Result<()> {
+        let id = self.id();
+        if id.label() == RewindWindowId::Main.label() {
+            #[cfg(target_os = "macos")]
+            {
+                MAIN_PANEL_SHOWN.store(false, std::sync::atomic::Ordering::SeqCst);
+                let app_clone = app.clone();
+                run_on_main_thread_safe(app, move || {
+                    for label in &["main", "main-window"] {
+                        if let Ok(panel) = app_clone.get_webview_panel(label) {
+                            if panel.is_visible() {
+                                unsafe {
+                                    use objc::{msg_send, sel, sel_impl};
+                                    let _: () = msg_send![&*panel, setAlphaValue: 0.0f64];
+                                }
+                                panel.order_out(None);
+                            }
+                        }
+                    }
+                    // Intentionally do NOT call restore_frontmost_app() here —
+                    // we're transitioning to another screenpipe window.
+                });
+            }
+
+            #[cfg(not(target_os = "macos"))]
+            {
+                for label in &["main", "main-window"] {
+                    if let Some(window) = app.get_webview_window(label) {
+                        window.hide().ok();
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     pub fn close(&self, app: &AppHandle) -> tauri::Result<()> {

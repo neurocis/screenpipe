@@ -12,6 +12,8 @@ import { Label } from "@/components/ui/label";
 import { Download, ExternalLink, Check, Loader2, Copy, Terminal, LogIn, LogOut, Send, X, HelpCircle, Search, Calendar as CalendarIcon, Eye, EyeOff } from "lucide-react";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { commands } from "@/lib/utils/tauri";
+import { useSettings } from "@/lib/hooks/use-settings";
+import { ensureChatGptPreset } from "@/lib/utils/chatgpt-preset";
 import { showChatWithPrefill } from "@/lib/chat-utils";
 import { Command } from "@tauri-apps/plugin-shell";
 import { openUrl } from "@tauri-apps/plugin-opener";
@@ -25,6 +27,8 @@ import { CalendarCard } from "./calendar-card";
 import { GoogleCalendarCard } from "./google-calendar-card";
 import { IcsCalendarCard } from "./ics-calendar-card";
 import { OpenClawCard } from "./openclaw-card";
+import { BrowserUrlCard } from "./browser-url-card";
+import { VoiceMemosCard } from "./voice-memos-card";
 
 // ---------------------------------------------------------------------------
 // Utility functions (unchanged)
@@ -232,6 +236,13 @@ function IntegrationIcon({ icon }: { icon: string }) {
     pushover: <img src="/images/pushover.png" alt="Pushover" className="w-5 h-5 rounded" />,
     ntfy: <img src="/images/ntfy.png" alt="ntfy" className="w-5 h-5 rounded" />,
     toggl: <img src="/images/toggl.png" alt="Toggl" className="w-5 h-5 rounded" />,
+    "browser-url": <img src="/images/browser-url.svg" alt="Browser URL" className="w-5 h-5 rounded" />,
+    "browser-extension": (
+      <svg viewBox="0 0 24 24" className="w-5 h-5" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+        <path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6" /><polyline points="15 3 21 3 21 9" /><line x1="10" y1="14" x2="21" y2="3" />
+      </svg>
+    ),
+    "voice-memos": <img src="/images/voice-memos.svg" alt="Voice Memos" className="w-5 h-5 rounded" />,
   };
   return (
     <div className="w-10 h-10 bg-muted rounded-xl flex items-center justify-center">
@@ -605,6 +616,87 @@ function LMStudioPanel() {
   );
 }
 
+function BrowserExtensionPanel({ connected, onRefresh }: { connected: boolean; onRefresh: () => void }) {
+  const [testing, setTesting] = useState(false);
+  const [testResult, setTestResult] = useState<string | null>(null);
+
+  const handleTest = async () => {
+    setTesting(true);
+    setTestResult(null);
+    try {
+      const r = await fetch("http://localhost:3030/browser/eval", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ code: "return document.title" }),
+      });
+      const d = await r.json();
+      if (d.success) {
+        setTestResult(`connected — active tab: "${d.result}"`);
+      } else {
+        setTestResult(`error: ${d.error}`);
+      }
+    } catch (e: any) {
+      setTestResult(`failed: ${e.message}`);
+    } finally {
+      setTesting(false);
+      onRefresh();
+    }
+  };
+
+  return (
+    <div className="space-y-4">
+      <div>
+        <h3 className="text-sm font-medium mb-1">browser extension</h3>
+        <p className="text-xs text-muted-foreground">
+          connects your browser to screenpipe so pipes can read data from authenticated pages
+          (ChatGPT history, Claude conversations, dashboards, etc.)
+        </p>
+      </div>
+
+      <div className="flex items-center gap-2">
+        <div className={`w-2 h-2 rounded-full ${connected ? "bg-green-500" : "bg-muted-foreground/30"}`} />
+        <span className="text-sm">{connected ? "connected" : "not connected"}</span>
+      </div>
+
+      {!connected && (
+        <div className="space-y-2">
+          <p className="text-xs text-muted-foreground">
+            install the extension, then it auto-connects when screenpipe is running.
+          </p>
+          <div className="flex gap-2">
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => openUrl("https://chromewebstore.google.com/detail/screenpipe-browser-bridge/bgiepgcbfoiikehdnkfffdkgpdhlijeh")}
+            >
+              chrome web store <ExternalLink className="w-3 h-3 ml-1" />
+            </Button>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => openUrl("https://github.com/screenpipe/screenpipe/tree/main/packages/browser-extension")}
+            >
+              manual install <ExternalLink className="w-3 h-3 ml-1" />
+            </Button>
+          </div>
+        </div>
+      )}
+
+      {connected && (
+        <div className="space-y-2">
+          <Button variant="outline" size="sm" onClick={handleTest} disabled={testing}>
+            {testing ? <Loader2 className="h-3 w-3 animate-spin mr-1" /> : <Check className="h-3 w-3 mr-1" />}
+            test connection
+          </Button>
+          {testResult && (
+            <p className="text-xs text-muted-foreground">{testResult}</p>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function WhatsAppPanel() {
   const [status, setStatus] = useState<"idle" | "pairing" | "connected" | "error">("idle");
   const [qr, setQr] = useState<string | null>(null);
@@ -710,7 +802,7 @@ function WhatsAppPanel() {
       {status === "pairing" && qr && (
         <div className="space-y-2">
           <p className="text-xs text-muted-foreground">scan this QR code with your WhatsApp app:</p>
-          <div className="bg-white p-3 rounded-lg inline-block">
+          <div className="bg-white p-3 rounded-lg inline-block border dark:border-border">
             <img
               src={`https://api.qrserver.com/v1/create-qr-code/?size=200x200&data=${encodeURIComponent(qr)}`}
               alt="WhatsApp QR Code"
@@ -745,6 +837,7 @@ function WhatsAppPanel() {
 
 function ChatGptPanel() {
   const [status, setStatus] = useState<"idle" | "loading" | "logged_in">("idle");
+  const { settings, updateSettings } = useSettings();
   useEffect(() => {
     commands.chatgptOauthStatus().then(res => {
       if (res.status === "ok" && res.data.logged_in) setStatus("logged_in");
@@ -764,7 +857,16 @@ function ChatGptPanel() {
             setStatus("loading");
             try {
               const res = await commands.chatgptOauthLogin();
-              setStatus(res.status === "ok" && res.data ? "logged_in" : "idle");
+              if (res.status === "ok" && res.data) {
+                setStatus("logged_in");
+                // auto-create a ChatGPT preset on first connection
+                await ensureChatGptPreset(
+                  settings.aiPresets || [],
+                  (presets) => updateSettings({ aiPresets: presets })
+                );
+              } else {
+                setStatus("idle");
+              }
             } catch { setStatus("idle"); }
           }} disabled={status === "loading"} size="sm" className="gap-1.5 h-7 text-xs normal-case font-sans tracking-normal">
             {status === "loading" ? (<><Loader2 className="h-3 w-3 animate-spin" />connecting...</>) : (<><LogIn className="h-3 w-3" />sign in with ChatGPT</>)}
@@ -906,9 +1008,10 @@ function ApiIntegrationPanel({ integration, onRefresh }: {
       ))}
       {error && <p className="text-xs text-destructive">{error}</p>}
       <div className="flex gap-2">
-        <Button onClick={handleTest} disabled={status === "testing" || status === "saving"} size="sm" className="gap-1.5 h-7 text-xs normal-case font-sans tracking-normal">
+        <Button onClick={handleTest} disabled={status === "testing" || status === "saving"} variant={status === "error" ? "outline" : "default"} size="sm" className="gap-1.5 h-7 text-xs normal-case font-sans tracking-normal">
           {status === "testing" ? (<><Loader2 className="h-3 w-3 animate-spin" />testing...</>)
            : status === "saving" ? (<><Loader2 className="h-3 w-3 animate-spin" />saving...</>)
+           : status === "error" ? (<>retry</>)
            : (<><Check className="h-3 w-3" />test &amp; save</>)}
         </Button>
         {integration.connected && (
@@ -959,10 +1062,13 @@ export function ConnectionsSection() {
   const [integrations, setIntegrations] = useState<IntegrationInfo[]>([]);
   const [integrationsLoaded, setIntegrationsLoaded] = useState(false);
 
+  const os = platform();
+
   // Hardcoded connection status
   const [claudeInstalled, setClaudeInstalled] = useState(false);
   const [cursorInstalled, setCursorInstalled] = useState(false);
   const [chatgptConnected, setChatgptConnected] = useState(false);
+  const [browserExtConnected, setBrowserExtConnected] = useState(false);
 
   const refreshStatus = useCallback(() => {
     getInstalledMcpVersion().then(v => {
@@ -975,6 +1081,10 @@ export function ConnectionsSection() {
     commands.chatgptOauthStatus().then(res => {
       setChatgptConnected(res.status === "ok" && res.data.logged_in);
     }).catch(() => {});
+    fetch("http://localhost:3030/browser/status")
+      .then(r => r.json())
+      .then(d => setBrowserExtConnected(d.connected === true))
+      .catch(() => setBrowserExtConnected(false));
   }, []);
 
   useEffect(() => { refreshStatus(); }, [selected, refreshStatus]);
@@ -1014,6 +1124,11 @@ export function ConnectionsSection() {
       { id: "cursor", name: "Cursor", icon: "cursor", connected: cursorInstalled },
       { id: "claude-code", name: "Claude Code", icon: "claude-code", connected: false },
       { id: "chatgpt", name: "ChatGPT", icon: "chatgpt", connected: chatgptConnected },
+      { id: "browser-extension", name: "Browser Extension", icon: "browser-extension", connected: browserExtConnected },
+      ...(os === "macos" ? [
+        { id: "browser-url", name: "Browser URL Capture", icon: "browser-url", connected: false },
+        { id: "voice-memos", name: "Voice Memos", icon: "voice-memos", connected: false },
+      ] : []),
       { id: "apple-intelligence", name: "Apple Intelligence", icon: "apple-intelligence", connected: false },
       { id: "apple-calendar", name: "Apple Calendar", icon: "apple-calendar", connected: false },
       { id: "google-calendar", name: "Google Calendar", icon: "google-calendar", connected: false },
@@ -1040,7 +1155,7 @@ export function ConnectionsSection() {
       if (api) h.connected = api.connected;
     }
     return [...hardcoded, ...apiTiles];
-  }, [claudeInstalled, cursorInstalled, chatgptConnected, integrations]);
+  }, [os, claudeInstalled, cursorInstalled, chatgptConnected, browserExtConnected, integrations]);
 
   const filtered = useMemo(() => {
     if (!search.trim()) return allTiles;
@@ -1057,6 +1172,9 @@ export function ConnectionsSection() {
       case "cursor": return <CursorPanel />;
       case "claude-code": return <ClaudeCodePanel />;
       case "chatgpt": return <ChatGptPanel />;
+      case "browser-extension": return <BrowserExtensionPanel connected={browserExtConnected} onRefresh={refreshStatus} />;
+      case "browser-url": return <BrowserUrlCard />;
+      case "voice-memos": return <VoiceMemosCard />;
       case "apple-intelligence": return <AppleIntelligenceCard />;
       case "apple-calendar": return <CalendarCard />;
       case "google-calendar": return <GoogleCalendarCard />;
@@ -1125,7 +1243,7 @@ export function ConnectionsSection() {
 
       {/* Expanded panel */}
       {selected && selectedTile && (() => {
-        const standaloneIds = ["apple-intelligence", "apple-calendar", "google-calendar", "ics-calendar", "openclaw"];
+        const standaloneIds = ["browser-url", "voice-memos", "apple-intelligence", "apple-calendar", "google-calendar", "ics-calendar", "openclaw"];
         if (standaloneIds.includes(selected)) {
           // These components render their own Card
           return <div ref={panelRef}>{renderPanel()}</div>;

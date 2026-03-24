@@ -16,7 +16,6 @@ import {
   Trash2,
   ChevronDown,
   ChevronRight,
-  FolderOpen,
   RefreshCw,
   Loader2,
   ExternalLink,
@@ -27,6 +26,9 @@ import {
   Search,
   Share2,
   Link,
+  Upload,
+  ArrowUpCircle,
+  MessageSquare,
 } from "lucide-react";
 import { Textarea } from "@/components/ui/textarea";
 import { Label } from "@/components/ui/label";
@@ -39,8 +41,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import { homeDir, join } from "@tauri-apps/api/path";
-import { revealItemInDir, openUrl } from "@tauri-apps/plugin-opener";
+import { openUrl } from "@tauri-apps/plugin-opener";
 import { emit, once } from "@tauri-apps/api/event";
 import { ChatPrefillData } from "@/lib/chat-utils";
 import { commands } from "@/lib/utils/tauri";
@@ -57,7 +58,10 @@ import { AIPresetsSelector } from "@/components/rewind/ai-presets-selector";
 import { useTeam } from "@/lib/hooks/use-team";
 import { useToast } from "@/components/ui/use-toast";
 import { HelpTooltip } from "@/components/ui/help-tooltip";
+import { pipeExecutionToConversation } from "@/lib/pipe-ndjson-to-chat";
+import { saveConversationFile } from "@/lib/chat-storage";
 import { UpgradeDialog } from "@/components/upgrade-dialog";
+import { PublishDialog } from "@/components/pipe-store";
 import posthog from "posthog-js";
 
 const PIPE_CREATION_PROMPT = `create a screenpipe pipe that does the following.
@@ -140,6 +144,48 @@ function navigateHomeAndPrefill(data: ChatPrefillData): void {
   window.location.href = url.toString();
 }
 
+/** Convert a raw schedule string to a short human-readable label. */
+function humanizeSchedule(schedule: string | undefined): string {
+  if (!schedule || schedule === "manual") return "manual";
+  // Simple "every Xm/h/d" patterns
+  const everyMatch = schedule.match(/^every\s+(\d+)\s*(m|h|d|s)/i);
+  if (everyMatch) {
+    const n = parseInt(everyMatch[1]);
+    const unit = everyMatch[2].toLowerCase();
+    if (unit === "m") return n < 60 ? `${n}min` : `${n / 60}h`;
+    if (unit === "h") return `${n}h`;
+    if (unit === "d") return `${n}d`;
+    return schedule;
+  }
+  // "every day at Xpm/am"
+  if (schedule.startsWith("every day")) return schedule;
+  // Cron: try to make it readable
+  const parts = schedule.trim().split(/\s+/);
+  if (parts.length === 5) {
+    const [min, hour, dom, mon, dow] = parts;
+    // */N * * * * → every Nmin
+    if (min.startsWith("*/") && hour === "*" && dom === "*" && mon === "*" && dow === "*") {
+      return `${min.slice(2)}min`;
+    }
+    // 0 */N * * * → every Nh
+    if (min === "0" && hour.startsWith("*/") && dom === "*" && mon === "*" && dow === "*") {
+      return `${hour.slice(2)}h`;
+    }
+    // */N with hour range → e.g. "30min, 3pm-11pm"
+    if (min.startsWith("*/") && hour !== "*") {
+      const interval = `${min.slice(2)}min`;
+      // Try to humanize hour range
+      const humanHours = hour.replace(/(\d+)/g, (_, h) => {
+        const n = parseInt(h);
+        return n === 0 ? "12am" : n < 12 ? `${n}am` : n === 12 ? "12pm" : `${n - 12}pm`;
+      }).replace("-", "–");
+      return `${interval} · ${humanHours}`;
+    }
+  }
+  // Fallback: truncate long crons
+  return schedule.length > 12 ? schedule.slice(0, 12) + "…" : schedule;
+}
+
 function buildOptimizePrompt(pipeName: string): string {
   const sessionDir = `~/.pi/agent/sessions/`;
   return `i need help optimizing my screenpipe pipe "${pipeName}".
@@ -196,6 +242,12 @@ function parsePipeError(stderr: string): {
           resets_at: parsed.resets_at,
         };
       }
+      if (parsed.error === "daily_cost_limit_exceeded") {
+        return {
+          type: "daily_limit",
+          message: `daily ai usage limit reached — try a lighter model or wait until tomorrow`,
+        };
+      }
       if (parsed.error === "rate limit exceeded") {
         return {
           type: "rate_limit",
@@ -245,6 +297,9 @@ interface PipeStatus {
   last_error: string | null;
   current_execution_id: number | null;
   consecutive_failures: number;
+  source_slug?: string;
+  installed_version?: number;
+  locally_modified?: boolean;
 }
 
 interface PipeRunLog {
@@ -603,6 +658,7 @@ export function PipesSection() {
   const isTeamAdmin = !!team.team && team.role === "admin";
   const [sharingPipe, setSharingPipe] = useState<string | null>(null);
   const [sharingPublic, setSharingPublic] = useState<string | null>(null);
+  const [publishPipeName, setPublishPipeName] = useState<string | null>(null);
   const [pipeFilter, setPipeFilter] = useState<"all" | "personal" | "team">(() => {
     if (typeof window !== "undefined") {
       return (localStorage.getItem("pipes-pipe-filter") as "all" | "personal" | "team") || "all";
@@ -610,13 +666,9 @@ export function PipesSection() {
     return "all";
   });
   const [searchQuery, setSearchQuery] = useState("");
-  const [statusFilter, setStatusFilter] = useState<"all" | "running" | "enabled" | "failed" | "scheduled" | "manual">(() => {
-    if (typeof window !== "undefined") {
-      return (localStorage.getItem("pipes-status-filter") as "all" | "running" | "enabled" | "failed" | "scheduled" | "manual") || "all";
-    }
-    return "all";
-  });
   const [availableConnections, setAvailableConnections] = useState<AvailableConnection[]>([]);
+  const [availableUpdates, setAvailableUpdates] = useState<Record<string, { latest_version: number; installed_version: number; locally_modified: boolean }>>({});
+  const [updatingPipe, setUpdatingPipe] = useState<string | null>(null);
   const sharedPipeNames = new Set(
     team.configs
       .filter((c) => c.config_type === "pipe" && c.scope === "team")
@@ -640,12 +692,8 @@ export function PipesSection() {
         if (!p.config.name.toLowerCase().includes(q)) return false;
       }
 
-      // Status filter
-      if (statusFilter === "running" && !p.is_running) return false;
-      if (statusFilter === "enabled" && !p.config.enabled) return false;
-      if (statusFilter === "failed" && p.last_success !== false) return false;
-      if (statusFilter === "scheduled" && !isScheduledPipe(p)) return false;
-      if (statusFilter === "manual" && !isManualPipe(p)) return false;
+      // Only show scheduled pipes
+      if (!isScheduledPipe(p)) return false;
 
       return true;
     })
@@ -660,11 +708,6 @@ export function PipesSection() {
     });
 
   // Counts for filter chips
-  const runningCount = pipes.filter((p) => p.is_running).length;
-  const enabledCount = pipes.filter((p) => p.config.enabled).length;
-  const failedCount = pipes.filter((p) => p.last_success === false).length;
-  const scheduledCount = pipes.filter((p) => isScheduledPipe(p)).length;
-  const manualCount = pipes.filter((p) => isManualPipe(p)).length;
 
   const sharePipeToTeam = async (pipe: PipeStatus) => {
     setSharingPipe(pipe.config.name);
@@ -768,9 +811,53 @@ export function PipesSection() {
     } catch { /* server may not be running */ }
   }, []);
 
+  const checkForUpdates = useCallback(async () => {
+    try {
+      const res = await fetch("http://localhost:3030/pipes/store/check-updates");
+      if (!res.ok) return;
+      const json = await res.json();
+      const updates: Record<string, { latest_version: number; installed_version: number; locally_modified: boolean }> = {};
+      for (const u of json.data || []) {
+        updates[u.pipe_name] = { latest_version: u.latest_version, installed_version: u.installed_version, locally_modified: u.locally_modified };
+      }
+      setAvailableUpdates(updates);
+    } catch {
+      // silently fail — not critical
+    }
+  }, []);
+
+  const updatePipe = async (pipeName: string, slug: string) => {
+    setUpdatingPipe(pipeName);
+    try {
+      const res = await fetch("http://localhost:3030/pipes/store/update", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ slug }),
+      });
+      if (!res.ok) {
+        const err = await res.json();
+        toast({ title: "update failed", description: err.error || "unknown error", variant: "destructive" });
+        return;
+      }
+      toast({ title: "pipe updated", description: `${pipeName} updated successfully` });
+      // Remove from updates map and refresh
+      setAvailableUpdates(prev => {
+        const next = { ...prev };
+        delete next[pipeName];
+        return next;
+      });
+      await fetchPipes();
+    } catch (e) {
+      toast({ title: "update failed", description: String(e), variant: "destructive" });
+    } finally {
+      setUpdatingPipe(null);
+    }
+  };
+
   const trackedPipesView = useRef(false);
   useEffect(() => {
     fetchConnections();
+    checkForUpdates();
     fetchPipes().then(() => {
       if (!trackedPipesView.current) {
         trackedPipesView.current = true;
@@ -942,12 +1029,6 @@ export function PipesSection() {
     fetchPipes();
   };
 
-  const openPipesFolder = async () => {
-    const home = await homeDir();
-    const path = await join(home, ".screenpipe", "pipes");
-    revealItemInDir(path);
-  };
-
   const toggleExpand = (name: string) => {
     if (expanded === name) {
       setExpanded(null);
@@ -1059,7 +1140,7 @@ export function PipesSection() {
   }
 
   return (
-    <div className="space-y-4">
+    <div className="space-y-4" data-testid="section-pipes">
       <div className="flex items-center justify-between">
         <div>
           <h3 className="text-lg font-medium">My Pipes</h3>
@@ -1078,7 +1159,7 @@ export function PipesSection() {
           </p>
         </div>
         <div className="flex items-center gap-2">
-          <Button variant="outline" size="sm" disabled={refreshing} onClick={async () => {
+          <Button variant="outline" size="icon" className="h-8 w-8" disabled={refreshing} onClick={async () => {
             setRefreshing(true);
             await Promise.all([
               fetchPipes(),
@@ -1088,9 +1169,13 @@ export function PipesSection() {
           }}>
             {refreshing ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}
           </Button>
-          <Button variant="outline" size="sm" onClick={openPipesFolder}>
-            <FolderOpen className="h-4 w-4 mr-1" />
-            open folder
+          <Button variant="outline" size="sm" onClick={() => {
+            const url = new URL(window.location.href);
+            url.searchParams.set("section", "connections");
+            window.location.href = url.toString();
+          }}>
+            <Link className="h-4 w-4 mr-1" />
+            connections
           </Button>
         </div>
       </div>
@@ -1105,29 +1190,6 @@ export function PipesSection() {
             onChange={(e) => setSearchQuery(e.target.value)}
             className="pl-8 h-8 text-sm"
           />
-        </div>
-        <div className="flex items-center gap-1.5 flex-wrap">
-          {([
-            { key: "all", label: "All", count: pipes.length },
-            { key: "running", label: "Running", count: runningCount },
-            { key: "enabled", label: "Enabled", count: enabledCount },
-            { key: "failed", label: "Failed", count: failedCount },
-            { key: "scheduled", label: "Scheduled", count: scheduledCount },
-            { key: "manual", label: "Manual", count: manualCount },
-          ] as const).map(({ key, label, count }) => (
-            <button
-              key={key}
-              onClick={() => { setStatusFilter(key); localStorage.setItem("pipes-status-filter", key); }}
-              className={cn(
-                "px-2.5 py-1 rounded-full text-xs transition-colors",
-                statusFilter === key
-                  ? "bg-foreground text-background font-medium"
-                  : "bg-muted text-muted-foreground hover:text-foreground"
-              )}
-            >
-              {label} {count > 0 && <span className="ml-0.5">{count}</span>}
-            </button>
-          ))}
         </div>
       </div>
 
@@ -1160,8 +1222,8 @@ export function PipesSection() {
       {filteredPipes.length === 0 ? (
         <Card>
           <CardContent className="py-8 text-center text-muted-foreground">
-            {searchQuery || statusFilter !== "all" ? (
-              <p>no pipes match your filters</p>
+            {searchQuery ? (
+              <p>no pipes match your search</p>
             ) : pipeFilter === "all" ? (
               <>
                 <p>no pipes installed</p>
@@ -1180,7 +1242,7 @@ export function PipesSection() {
           </CardContent>
         </Card>
       ) : (
-        <div className="space-y-2">
+        <div className="border border-border rounded-md divide-y divide-border">
           {/* Global daily limit / credits exhausted banner — shown once at top */}
           {(() => {
             const errors = filteredPipes
@@ -1191,23 +1253,15 @@ export function PipesSection() {
             );
             if (!limitError) return null;
             return (
-              <div className="flex items-center gap-2 text-xs px-4 py-2 border rounded-md">
+              <div className="flex items-center gap-2 text-xs px-4 py-2">
                 <span className="text-muted-foreground">
                   {limitError.type === "credits_exhausted"
-                    ? "no credits remaining — buy more at screenpi.pe"
+                    ? "daily ai usage limit reached — try a lighter model or wait until tomorrow"
                     : limitError.message}
                   {limitError.resets_at && (
                     <> · resets {new Date(limitError.resets_at).toLocaleTimeString()}</>
                   )}
                 </span>
-                <Button
-                  variant="outline"
-                  size="sm"
-                  className="h-6 text-[11px] px-2"
-                  onClick={() => openUrl("https://screenpi.pe/billing")}
-                >
-                  buy credits →
-                </Button>
               </div>
             );
           })()}
@@ -1215,28 +1269,92 @@ export function PipesSection() {
             const recentExecs = pipeExecutions[pipe.config.name] || [];
             const isRunning = pipe.is_running || runningPipe === pipe.config.name;
             const runningExec = recentExecs.find((e) => e.status === "running");
+            const lastExec = recentExecs[0];
+            const lastStatus = isRunning
+              ? "running"
+              : pipe.last_success === false
+                ? "error"
+                : lastExec?.status === "completed"
+                  ? "ok"
+                  : lastExec?.status === "failed"
+                    ? "error"
+                    : "idle";
 
             return (
-            <Card key={pipe.config.name} className={cn(!pipe.config.enabled && "opacity-50")}>
-              <CardContent className="p-4">
-                {/* Header row */}
-                <div className="flex items-center gap-2">
-                  <button
-                    onClick={() => toggleExpand(pipe.config.name)}
-                    className="flex items-center gap-1 text-sm font-medium flex-1 text-left min-w-0"
+            <div key={pipe.config.name} className={cn("group", !pipe.config.enabled && "opacity-50")}>
+              {/* Table row */}
+              <div className="flex items-center gap-3 px-4 py-2.5 hover:bg-accent/50 transition-colors">
+                {/* Status indicator — monochrome, brand-aligned */}
+                <span
+                  className={cn(
+                    "h-1.5 w-1.5 shrink-0",
+                    lastStatus === "ok" && "bg-foreground",
+                    lastStatus === "running" && "bg-foreground animate-pulse",
+                    lastStatus === "error" && "border border-foreground bg-transparent",
+                    lastStatus === "idle" && "bg-muted-foreground/30",
+                  )}
+                  title={lastStatus}
+                />
+
+                {/* Pipe name — click to expand */}
+                <button
+                  onClick={() => toggleExpand(pipe.config.name)}
+                  className="text-sm font-medium truncate text-left min-w-0 flex-1 hover:underline"
+                >
+                  {pipe.config.name}
+                </button>
+
+                {/* Update badge */}
+                {availableUpdates[pipe.config.name] && (
+                  <Badge
+                    variant="outline"
+                    className="text-[10px] shrink-0 cursor-pointer border-foreground/30 text-muted-foreground hover:bg-accent transition-colors"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      const update = availableUpdates[pipe.config.name];
+                      const slug = (pipe.config as any).config?.source_slug as string || pipe.source_slug || pipe.config.name;
+                      if (update.locally_modified) {
+                        if (confirm(`you have local changes to this pipe. updating to v${update.latest_version} will overwrite them. continue?`)) {
+                          updatePipe(pipe.config.name, slug);
+                        }
+                      } else {
+                        updatePipe(pipe.config.name, slug);
+                      }
+                    }}
                   >
-                    {expanded === pipe.config.name ? (
-                      <ChevronDown className="h-4 w-4 shrink-0" />
+                    {updatingPipe === pipe.config.name ? (
+                      <Loader2 className="h-3 w-3 mr-1 animate-spin" />
                     ) : (
-                      <ChevronRight className="h-4 w-4 shrink-0" />
+                      <ArrowUpCircle className="h-3 w-3 mr-1" />
                     )}
-                    <span className="truncate">{pipe.config.name}</span>
-                  </button>
-
-                  <Badge variant="outline" className="text-xs shrink-0">
-                    {pipe.config.schedule}
+                    v{availableUpdates[pipe.config.name].installed_version} → v{availableUpdates[pipe.config.name].latest_version}
                   </Badge>
+                )}
 
+                {/* Schedule */}
+                <span
+                  className="text-xs text-muted-foreground shrink-0 text-right font-mono truncate max-w-[120px]"
+                  title={pipe.config.schedule || "manual"}
+                >
+                  {humanizeSchedule(pipe.config.schedule)}
+                </span>
+
+                {/* Last run time */}
+                <span className="text-xs text-muted-foreground shrink-0 w-20 text-right font-mono">
+                  {isRunning && runningExec?.started_at ? (
+                    <span className="flex items-center justify-end gap-1">
+                      <Loader2 className="h-2.5 w-2.5 animate-spin" />
+                      <ElapsedTimer startedAt={runningExec.started_at} />
+                    </span>
+                  ) : lastExec?.started_at ? (
+                    relativeTime(lastExec.started_at)
+                  ) : (
+                    "—"
+                  )}
+                </span>
+
+                {/* Hover-reveal actions */}
+                <div className="flex items-center gap-0.5 opacity-0 group-hover:opacity-100 transition-opacity shrink-0">
                   {/* Run / Stop button */}
                   {isRunning ? (
                     <Button
@@ -1266,30 +1384,6 @@ export function PipesSection() {
                     </Button>
                   )}
 
-                  <Switch
-                    checked={pipe.config.enabled}
-                    onCheckedChange={(checked) =>
-                      togglePipe(pipe.config.name, checked)
-                    }
-                  />
-
-                  {/* Optimize with AI */}
-                  <Button
-                    variant="ghost"
-                    size="icon"
-                    className="h-7 w-7 shrink-0"
-                    title="optimize with ai"
-                    onClick={() => {
-                      navigateHomeAndPrefill({
-                        context: "the user wants to optimize their pipe",
-                        prompt: buildOptimizePrompt(pipe.config.name),
-                        autoSend: true,
-                      });
-                    }}
-                  >
-                    <Sparkles className="h-3.5 w-3.5" />
-                  </Button>
-
                   {/* Overflow menu */}
                   <DropdownMenu>
                     <DropdownMenuTrigger asChild>
@@ -1298,6 +1392,18 @@ export function PipesSection() {
                       </Button>
                     </DropdownMenuTrigger>
                     <DropdownMenuContent align="end">
+                      <DropdownMenuItem
+                        onClick={() => {
+                          navigateHomeAndPrefill({
+                            context: "the user wants to optimize their pipe",
+                            prompt: buildOptimizePrompt(pipe.config.name),
+                            autoSend: true,
+                          });
+                        }}
+                      >
+                        <Sparkles className="h-3.5 w-3.5 mr-2" />
+                        optimize with ai
+                      </DropdownMenuItem>
                       <DropdownMenuItem
                         disabled={sharingPublic === pipe.config.name}
                         onClick={() => sharePipePublic(pipe)}
@@ -1324,6 +1430,23 @@ export function PipesSection() {
                           </DropdownMenuItem>
                         </>
                       )}
+                      {(pipe.source_slug || (pipe.config as any).config?.source_slug) && (
+                        <DropdownMenuItem
+                          onClick={() => {
+                            checkForUpdates();
+                            toast({ title: "checking for updates..." });
+                          }}
+                        >
+                          <RefreshCw className="h-3.5 w-3.5 mr-2" />
+                          check for updates
+                        </DropdownMenuItem>
+                      )}
+                      <DropdownMenuItem
+                        onClick={() => setPublishPipeName(pipe.config.name)}
+                      >
+                        <Upload className="h-3.5 w-3.5 mr-2" />
+                        publish to store
+                      </DropdownMenuItem>
                       <DropdownMenuSeparator />
                       <DropdownMenuItem
                         className="text-destructive"
@@ -1336,110 +1459,33 @@ export function PipesSection() {
                   </DropdownMenu>
                 </div>
 
-                {/* Live running indicator */}
-                {isRunning && (
-                  <div className="mt-2 flex items-center gap-2 text-xs">
-                    <Loader2 className="h-3 w-3 animate-spin text-muted-foreground" />
-                    <span className="text-muted-foreground">running</span>
-                    {runningExec?.started_at && (
-                      <span className="font-mono text-muted-foreground">
-                        <ElapsedTimer startedAt={runningExec.started_at} />
-                      </span>
-                    )}
-                  </div>
-                )}
+                {/* Toggle — only visible on hover */}
+                <div className="opacity-0 group-hover:opacity-100 transition-opacity">
+                  <Switch
+                    checked={pipe.config.enabled}
+                    onCheckedChange={(checked) =>
+                      togglePipe(pipe.config.name, checked)
+                    }
+                  />
+                </div>
+              </div>
 
-                {/* Per-pipe error (skip daily_limit/credits_exhausted — shown globally above) */}
-                {!isRunning && pipe.last_success === false && pipe.last_error && (() => {
-                  const error = parsePipeError(pipe.last_error);
-                  if (error.type === "daily_limit" || error.type === "credits_exhausted") return null;
-                  if (error.type === "rate_limit") {
-                    return (
-                      <p className="mt-2 text-xs text-muted-foreground">{error.message}</p>
-                    );
-                  }
-                  return (
-                    <p className="mt-2 text-xs text-muted-foreground truncate max-w-full">
+              {/* Error line (inline, below row) */}
+              {!isRunning && pipe.last_success === false && pipe.last_error && (() => {
+                const error = parsePipeError(pipe.last_error);
+                if (error.type === "daily_limit" || error.type === "credits_exhausted") return null;
+                return (
+                  <div className="px-4 pb-2 -mt-1">
+                    <p className="text-[11px] text-red-500/80 truncate max-w-full pl-5">
                       {error.message}
                     </p>
-                  );
-                })()}
-
-                {/* Last run — single line summary */}
-                {recentExecs.length > 0 && (() => {
-                  const exec = recentExecs[0];
-                  return (
-                  <div className="mt-1.5 flex items-center gap-2 text-[11px] font-mono text-muted-foreground">
-                    <span>
-                      {exec.started_at ? relativeTime(exec.started_at) : "queued"}
-                    </span>
-                    <span className="text-muted-foreground/50">·</span>
-                    {exec.status === "completed" ? (
-                      <span className="text-foreground">ok</span>
-                    ) : exec.status === "running" ? (
-                      <span className="flex items-center gap-1">
-                        <Loader2 className="h-2.5 w-2.5 animate-spin" />
-                        running
-                        {exec.started_at && <ElapsedTimer startedAt={exec.started_at} />}
-                        <button
-                          className="text-[10px] text-primary underline hover:no-underline ml-1"
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            sessionStorage.setItem(
-                              "watchPipe",
-                              JSON.stringify({
-                                pipeName: pipe.config.name,
-                                executionId: exec.id,
-                                presetId: (Array.isArray(pipe.config.preset) ? pipe.config.preset[0] : pipe.config.preset) || null,
-                              })
-                            );
-                            emit("watch_pipe", {
-                              pipeName: pipe.config.name,
-                              executionId: exec.id,
-                              presetId: (Array.isArray(pipe.config.preset) ? pipe.config.preset[0] : pipe.config.preset) || null,
-                            });
-                          }}
-                          title="watch live output"
-                        >
-                          watch
-                        </button>
-                      </span>
-                    ) : exec.status === "failed" ? (
-                      <span className="text-foreground font-medium">failed</span>
-                    ) : exec.status === "timed_out" ? (
-                      <span className="text-muted-foreground">timeout</span>
-                    ) : (
-                      <span>{exec.status}</span>
-                    )}
-                    {exec.duration_ms != null && exec.status !== "running" && (
-                      <>
-                        <span className="text-muted-foreground/50">·</span>
-                        <span>{formatDuration(exec.duration_ms)}</span>
-                      </>
-                    )}
-                    {exec.error_type && (
-                      <>
-                        <span className="text-muted-foreground/50">·</span>
-                        <span className="text-muted-foreground">
-                          {exec.error_type.replace("_", " ")}
-                        </span>
-                      </>
-                    )}
-                    {exec.status === "completed" && exec.stdout && !exec.error_type && (
-                      <>
-                        <span className="text-muted-foreground/50">·</span>
-                        <span className="truncate max-w-[200px]">
-                          {cleanPipeStdout(exec.stdout).split("\n")[0].slice(0, 50) || "done"}
-                        </span>
-                      </>
-                    )}
                   </div>
-                  );
-                })()}
+                );
+              })()}
 
-                {/* Expanded detail */}
-                {expanded === pipe.config.name && (
-                  <div className="mt-4 space-y-4 border-t pt-4">
+              {/* Expanded detail */}
+              {expanded === pipe.config.name && (
+                  <div className="mt-4 space-y-4 border-t pt-4 px-4">
                     <PipePresetSelector
                       pipe={pipe}
                       setPipes={setPipes}
@@ -1716,6 +1762,32 @@ export function PipesSection() {
                                 <span className="text-muted-foreground">
                                   {exec.trigger_type}
                                 </span>
+                                {exec.stdout && (
+                                  <button
+                                    className="ml-auto text-muted-foreground hover:text-foreground transition-colors"
+                                    title="view in chat"
+                                    onClick={async (e) => {
+                                      e.stopPropagation();
+                                      const conv = pipeExecutionToConversation(
+                                        exec.pipe_name,
+                                        exec.id,
+                                        exec.stdout,
+                                        exec.started_at,
+                                      );
+                                      await saveConversationFile(conv);
+                                      // Store pending conversation ID so StandaloneChat
+                                      // picks it up on mount (emit alone is lost during
+                                      // page navigation because the listener isn't mounted yet)
+                                      localStorage.setItem("pending-chat-conversation", conv.id);
+                                      // Navigate to home/chat section via query param
+                                      const url = new URL(window.location.href);
+                                      url.searchParams.set("section", "home");
+                                      window.location.href = url.toString();
+                                    }}
+                                  >
+                                    <MessageSquare className="w-3.5 h-3.5" />
+                                  </button>
+                                )}
                               </div>
                               {exec.error_message && (
                                 <p className="text-xs text-muted-foreground">
@@ -1723,13 +1795,13 @@ export function PipesSection() {
                                 </p>
                               )}
                               {exec.status === "completed" && exec.stdout && cleanPipeStdout(exec.stdout) && (
-                                <pre className="text-xs text-muted-foreground whitespace-pre-wrap break-words max-h-20 overflow-y-auto">
-                                  {cleanPipeStdout(exec.stdout).slice(0, 500)}
+                                <pre className="text-xs text-muted-foreground whitespace-pre-wrap break-words max-h-96 overflow-y-auto">
+                                  {cleanPipeStdout(exec.stdout)}
                                 </pre>
                               )}
                               {exec.status === "failed" && exec.stderr && !exec.error_message && (
-                                <pre className="text-xs text-muted-foreground whitespace-pre-wrap break-words max-h-20 overflow-y-auto">
-                                  {exec.stderr.slice(0, 500)}
+                                <pre className="text-xs text-muted-foreground whitespace-pre-wrap break-words max-h-96 overflow-y-auto">
+                                  {exec.stderr}
                                 </pre>
                               )}
                             </div>
@@ -1761,13 +1833,13 @@ export function PipesSection() {
                                   </span>
                                 </div>
                                 {log.success && log.stdout && cleanPipeStdout(log.stdout) && (
-                                  <pre className="text-xs text-muted-foreground whitespace-pre-wrap break-words max-h-20 overflow-y-auto">
-                                    {cleanPipeStdout(log.stdout).slice(0, 500)}
+                                  <pre className="text-xs text-muted-foreground whitespace-pre-wrap break-words max-h-96 overflow-y-auto">
+                                    {cleanPipeStdout(log.stdout)}
                                   </pre>
                                 )}
                                 {!log.success && log.stderr && (
-                                  <pre className="text-xs text-muted-foreground whitespace-pre-wrap break-words max-h-20 overflow-y-auto">
-                                    {log.stderr.slice(0, 500)}
+                                  <pre className="text-xs text-muted-foreground whitespace-pre-wrap break-words max-h-96 overflow-y-auto">
+                                    {log.stderr}
                                   </pre>
                                 )}
                               </div>
@@ -1778,8 +1850,7 @@ export function PipesSection() {
 
                   </div>
                 )}
-              </CardContent>
-            </Card>
+            </div>
             );
           })}
         </div>
@@ -1816,6 +1887,17 @@ export function PipesSection() {
         onOpenChange={setShowUpgrade}
         reason="daily_limit"
         source="pipes"
+      />
+
+      <PublishDialog
+        open={!!publishPipeName}
+        onOpenChange={(v) => { if (!v) setPublishPipeName(null); }}
+        token={settings.user?.token}
+        onPublished={() => {
+          setPublishPipeName(null);
+          toast({ title: "pipe published to store" });
+        }}
+        defaultPipe={publishPipeName || undefined}
       />
 
     </div>

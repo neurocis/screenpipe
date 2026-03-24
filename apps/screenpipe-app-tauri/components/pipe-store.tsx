@@ -31,7 +31,6 @@ import {
 } from "@/components/ui/select";
 import {
   Search,
-  Star,
   Download,
   Shield,
   ChevronDown,
@@ -51,6 +50,7 @@ import {
   AlertTriangle,
   ArrowLeft,
   ExternalLink,
+  GitFork,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { useSettings } from "@/lib/hooks/use-settings";
@@ -59,6 +59,7 @@ import { MemoizedReactMarkdown } from "@/components/markdown";
 import remarkGfm from "remark-gfm";
 import posthog from "posthog-js";
 import { PipesSection } from "@/components/settings/pipes-section";
+import { ChatPrefillData } from "@/lib/chat-utils";
 
 // --- Types ---
 
@@ -83,6 +84,13 @@ interface StorePipe {
 }
 
 interface PipePermissions {
+  /// Unified permissions preset or rule summary from pipe.md frontmatter.
+  preset?: string; // "reader", "writer", "admin", "none"
+  allow_rules?: string[]; // e.g. ["Api(GET /search)", "App(Slack)", "Content(ocr)"]
+  deny_rules?: string[]; // e.g. ["Api(* /meetings/stop)", "App(1Password)"]
+  time?: string;
+  days?: string;
+  // Legacy fields for backwards compat with older store entries
   allow_ocr?: boolean;
   allow_audio?: boolean;
   allow_input?: boolean;
@@ -117,11 +125,12 @@ interface LocalPipe {
 
 // --- Helpers ---
 
-const CATEGORIES = ["All", "Productivity", "Dev", "Health", "Social", "Other"];
+// Categories are derived dynamically from pipe metadata — no hardcoded taxonomy.
+// Only PUBLISH_CATEGORIES is kept as a suggestion list for the publish form.
+const PUBLISH_CATEGORIES = ["Productivity", "Dev", "Health", "Social", "Other"];
 const SORT_OPTIONS = [
   { value: "popular", label: "Popular" },
   { value: "newest", label: "Newest" },
-  { value: "top_rated", label: "Top Rated" },
 ];
 
 const PERMISSION_LABELS: { key: string; label: string; icon: React.ReactNode }[] = [
@@ -162,51 +171,14 @@ function getReadmeFromPipeMd(raw: string): string {
   return trimmed.slice(end + 3).trim();
 }
 
-function StarRating({
-  rating,
-  size = "sm",
-  interactive = false,
-  onChange,
-}: {
-  rating: number;
-  size?: "sm" | "md";
-  interactive?: boolean;
-  onChange?: (r: number) => void;
-}) {
-  const [hovered, setHovered] = useState(0);
-  const iconSize = size === "sm" ? "h-3 w-3" : "h-4 w-4";
-  return (
-    <div className="flex items-center gap-0.5">
-      {[1, 2, 3, 4, 5].map((i) => {
-        const filled = interactive ? i <= (hovered || rating) : i <= Math.round(rating);
-        return (
-          <button
-            key={i}
-            type="button"
-            disabled={!interactive}
-            className={cn(
-              "transition-colors",
-              interactive && "cursor-pointer hover:scale-110",
-              !interactive && "cursor-default"
-            )}
-            onMouseEnter={() => interactive && setHovered(i)}
-            onMouseLeave={() => interactive && setHovered(0)}
-            onClick={() => interactive && onChange?.(i)}
-          >
-            <Star
-              className={cn(
-                iconSize,
-                filled
-                  ? "fill-foreground text-foreground"
-                  : "text-muted-foreground/30"
-              )}
-            />
-          </button>
-        );
-      })}
-    </div>
-  );
+function navigateHomeAndPrefill(data: ChatPrefillData): void {
+  sessionStorage.setItem("pendingChatPrefill", JSON.stringify(data));
+  const url = new URL(window.location.href);
+  url.searchParams.set("section", "home");
+  window.location.href = url.toString();
 }
+
+
 
 function formatCount(n: number): string {
   if (n >= 1000) return `${(n / 1000).toFixed(1)}k`;
@@ -303,6 +275,18 @@ function DiscoverView() {
   const [category, setCategory] = useState("All");
   const [sort, setSort] = useState("popular");
 
+  // Derive unique categories from pipe data
+  const dynamicCategories = useMemo(() => {
+    const counts = new Map<string, number>();
+    for (const p of pipes) {
+      const cat = p.category || "other";
+      const label = cat.charAt(0).toUpperCase() + cat.slice(1);
+      counts.set(label, (counts.get(label) || 0) + 1);
+    }
+    // Sort by count descending
+    return ["All", ...Array.from(counts.entries()).sort((a, b) => b[1] - a[1]).map(([name]) => name)];
+  }, [pipes]);
+
   // Detail view
   const [selectedPipe, setSelectedPipe] = useState<PipeDetail | null>(null);
   const [detailLoading, setDetailLoading] = useState(false);
@@ -330,6 +314,9 @@ function DiscoverView() {
   // Installed pipe names (for "Installed" badge)
   const [installedNames, setInstalledNames] = useState<Set<string>>(new Set());
 
+  // Available updates from store
+  const [availableUpdates, setAvailableUpdates] = useState<Record<string, { latest_version: number; installed_version: number; locally_modified: boolean }>>({});
+
   // Fetch installed pipes (cached 30s, invalidated on install)
   useEffect(() => {
     const cacheKey = "pipes/installed";
@@ -349,6 +336,21 @@ function DiscoverView() {
       .catch(() => {});
   }, [showDetail]);
 
+  // Check for pipe updates
+  useEffect(() => {
+    fetch("http://localhost:3030/pipes/store/check-updates")
+      .then((r) => r.ok ? r.json() : null)
+      .then((json) => {
+        if (!json) return;
+        const updates: Record<string, { latest_version: number; installed_version: number; locally_modified: boolean }> = {};
+        for (const u of json.data || []) {
+          updates[u.pipe_name] = { latest_version: u.latest_version, installed_version: u.installed_version, locally_modified: u.locally_modified };
+        }
+        setAvailableUpdates(updates);
+      })
+      .catch(() => {});
+  }, [showDetail]);
+
   // Debounce search
   const debounceRef = useRef<ReturnType<typeof setTimeout>>();
   useEffect(() => {
@@ -357,10 +359,10 @@ function DiscoverView() {
   }, [searchQuery]);
 
   // Fetch pipes with stale-while-revalidate caching
+  // Category filtering is done client-side so we always have all categories for the pills
   const fetchPipes = useCallback(async () => {
     const params = new URLSearchParams();
     if (debouncedQuery) params.set("q", debouncedQuery);
-    if (category !== "All") params.set("category", category.toLowerCase());
     if (sort) params.set("sort", sort);
     const cacheKey = `pipes/store?${params}`;
 
@@ -374,9 +376,12 @@ function DiscoverView() {
       setLoading(true);
     }
 
-    // Fetch fresh data in background
+    // Fetch fresh data in background (10s timeout to avoid infinite skeletons)
     try {
-      const res = await fetch(`http://localhost:3030/pipes/store?${params}`);
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 10_000);
+      const res = await fetch(`http://localhost:3030/pipes/store?${params}`, { signal: controller.signal });
+      clearTimeout(timeoutId);
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data = await res.json();
       const list = data.data || data.pipes || (Array.isArray(data) ? data : []);
@@ -389,7 +394,7 @@ function DiscoverView() {
     } finally {
       setLoading(false);
     }
-  }, [debouncedQuery, category, sort]);
+  }, [debouncedQuery, sort]);
 
   useEffect(() => {
     fetchPipes();
@@ -438,13 +443,29 @@ function DiscoverView() {
       const data = await res.json();
       if (!res.ok || data.error) throw new Error(data.error || `HTTP ${res.status}`);
       posthog.capture("pipe_installed_from_store", { slug });
+
+      // Override the pipe's preset with the user's default preset so it
+      // works out of the box (published pipes may reference presets the
+      // user doesn't have).
+      const pipeName = data.name || slug;
+      const defaultPreset = settings.aiPresets?.find((p: any) => p.defaultPreset);
+      if (defaultPreset?.id) {
+        try {
+          await fetch(`http://localhost:3030/pipes/${pipeName}/config`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ preset: defaultPreset.id }),
+          });
+        } catch {}
+      }
+
       toast({
-        title: `"${data.name || slug}" installed`,
+        title: `"${pipeName}" installed`,
         description: "switch to my pipes to configure and run it",
       });
       // Invalidate cache and update installed names
       apiCache.invalidate("pipes/installed");
-      setInstalledNames((prev) => new Set([...prev, data.name || slug]));
+      setInstalledNames((prev) => new Set([...prev, pipeName]));
     } catch (err: any) {
       toast({
         title: "failed to install pipe",
@@ -517,6 +538,17 @@ function DiscoverView() {
     }
   };
 
+  // Client-side category filter (must be before any early returns to keep hook count stable)
+  const filteredPipes = useMemo(() => {
+    if (category === "All") return pipes;
+    return pipes.filter((p) => {
+      const cat = (p.category || "other").charAt(0).toUpperCase() + (p.category || "other").slice(1);
+      return cat === category;
+    });
+  }, [pipes, category]);
+
+  const featuredPipes = filteredPipes.filter((p) => p.featured);
+
   // If showing detail view, render full-width detail panel
   if (showDetail) {
     return (
@@ -544,17 +576,9 @@ function DiscoverView() {
             onSourceReviewedChange={setSourceReviewed}
             onInstall={handleInstall}
             isInstalled={installedNames.has(selectedPipe.slug)}
-            reviewExpanded={reviewExpanded}
-            onToggleReview={() => setReviewExpanded(!reviewExpanded)}
-            reviewRating={reviewRating}
-            onReviewRatingChange={setReviewRating}
-            reviewComment={reviewComment}
-            onReviewCommentChange={setReviewComment}
-            submittingReview={submittingReview}
-            onSubmitReview={handleSubmitReview}
+            hasUpdate={!!availableUpdates[selectedPipe.slug]}
             sourceExpanded={sourceExpanded}
             onToggleSource={() => setSourceExpanded(!sourceExpanded)}
-            token={token}
             currentUserId={settings.user?.id}
             onUnpublish={handleUnpublish}
             unpublishing={unpublishing}
@@ -563,8 +587,6 @@ function DiscoverView() {
       </div>
     );
   }
-
-  const featuredPipes = pipes.filter((p) => p.featured);
 
   return (
     <div className="space-y-6">
@@ -610,7 +632,7 @@ function DiscoverView() {
 
         {/* Category pills */}
         <div className="flex items-center gap-1.5 overflow-x-auto pb-1">
-          {CATEGORIES.map((c) => (
+          {dynamicCategories.map((c) => (
             <button
               key={c}
               onClick={() => setCategory(c)}
@@ -639,6 +661,7 @@ function DiscoverView() {
                 key={pipe.slug}
                 pipe={pipe}
                 isInstalled={installedNames.has(pipe.slug)}
+                hasUpdate={!!availableUpdates[pipe.slug]}
                 onInstall={() => handleInstall(pipe.slug)}
                 installing={installing === pipe.slug}
                 onClick={() => openDetail(pipe.slug)}
@@ -678,11 +701,12 @@ function DiscoverView() {
         </Card>
       ) : (
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-          {pipes.map((pipe) => (
+          {filteredPipes.filter((p) => !p.featured || !!debouncedQuery || category !== "All").map((pipe) => (
             <PipeCard
               key={pipe.slug}
               pipe={pipe}
               isInstalled={installedNames.has(pipe.slug)}
+              hasUpdate={!!availableUpdates[pipe.slug]}
               onInstall={() => handleInstall(pipe.slug)}
               installing={installing === pipe.slug}
               onClick={() => openDetail(pipe.slug)}
@@ -710,12 +734,14 @@ function DiscoverView() {
 function FeaturedCard({
   pipe,
   isInstalled,
+  hasUpdate,
   onInstall,
   installing,
   onClick,
 }: {
   pipe: StorePipe;
   isInstalled: boolean;
+  hasUpdate?: boolean;
   onInstall: () => void;
   installing: boolean;
   onClick: () => void;
@@ -745,12 +771,13 @@ function FeaturedCard({
           </div>
           <Button
             size="sm"
-            variant={isInstalled ? "outline" : "default"}
+            variant={isInstalled && !hasUpdate ? "outline" : "default"}
             className={cn(
               "h-7 px-3 text-xs font-semibold rounded-none uppercase tracking-wide flex-shrink-0",
-              isInstalled && "pointer-events-none"
+              isInstalled && !hasUpdate && "pointer-events-none",
+              hasUpdate && "bg-amber-500 hover:bg-amber-600 text-white"
             )}
-            disabled={installing || isInstalled}
+            disabled={installing || (isInstalled && !hasUpdate)}
             onClick={(e) => {
               e.stopPropagation();
               onInstall();
@@ -758,6 +785,8 @@ function FeaturedCard({
           >
             {installing ? (
               <Loader2 className="h-3 w-3 animate-spin" />
+            ) : hasUpdate ? (
+              "UPDATE"
             ) : isInstalled ? (
               "INSTALLED"
             ) : (
@@ -776,10 +805,6 @@ function FeaturedCard({
           </Badge>
           <div className="flex items-center gap-3 text-xs text-muted-foreground">
             <span className="flex items-center gap-1">
-              <StarRating rating={pipe.rating ?? 0} />
-              <span>{(pipe.rating ?? 0).toFixed(1)}</span>
-            </span>
-            <span className="flex items-center gap-1">
               <Download className="h-3 w-3" />
               {formatCount(pipe.install_count ?? 0)}
             </span>
@@ -793,12 +818,14 @@ function FeaturedCard({
 function PipeCard({
   pipe,
   isInstalled,
+  hasUpdate,
   onInstall,
   installing,
   onClick,
 }: {
   pipe: StorePipe;
   isInstalled: boolean;
+  hasUpdate?: boolean;
   onInstall: () => void;
   installing: boolean;
   onClick: () => void;
@@ -830,12 +857,13 @@ function PipeCard({
             </div>
             <Button
               size="sm"
-              variant={isInstalled ? "outline" : "default"}
+              variant={isInstalled && !hasUpdate ? "outline" : "default"}
               className={cn(
                 "h-7 px-3 text-xs font-semibold rounded-none uppercase tracking-wide flex-shrink-0",
-                isInstalled && "pointer-events-none"
+                isInstalled && !hasUpdate && "pointer-events-none",
+                hasUpdate && "bg-amber-500 hover:bg-amber-600 text-white"
               )}
-              disabled={installing || isInstalled}
+              disabled={installing || (isInstalled && !hasUpdate)}
               onClick={(e) => {
                 e.stopPropagation();
                 onInstall();
@@ -843,6 +871,8 @@ function PipeCard({
             >
               {installing ? (
                 <Loader2 className="h-3 w-3 animate-spin" />
+              ) : hasUpdate ? (
+                "UPDATE"
               ) : isInstalled ? (
                 "INSTALLED"
               ) : (
@@ -879,10 +909,6 @@ function PipeCard({
 
       <div className="flex items-center gap-3 mt-3 text-xs text-muted-foreground">
         <span className="flex items-center gap-1">
-          <StarRating rating={pipe.rating ?? 0} />
-          <span>{(pipe.rating ?? 0).toFixed(1)}</span>
-        </span>
-        <span className="flex items-center gap-1">
           <Download className="h-3 w-3" />
           {formatCount(pipe.install_count ?? 0)}
         </span>
@@ -900,17 +926,9 @@ function PipeDetailPanel({
   onSourceReviewedChange,
   onInstall,
   isInstalled,
-  reviewExpanded,
-  onToggleReview,
-  reviewRating,
-  onReviewRatingChange,
-  reviewComment,
-  onReviewCommentChange,
-  submittingReview,
-  onSubmitReview,
+  hasUpdate,
   sourceExpanded,
   onToggleSource,
-  token,
   currentUserId,
   onUnpublish,
   unpublishing,
@@ -921,17 +939,9 @@ function PipeDetailPanel({
   onSourceReviewedChange: (v: boolean) => void;
   onInstall: (slug: string) => void;
   isInstalled: boolean;
-  reviewExpanded: boolean;
-  onToggleReview: () => void;
-  reviewRating: number;
-  onReviewRatingChange: (r: number) => void;
-  reviewComment: string;
-  onReviewCommentChange: (c: string) => void;
-  submittingReview: boolean;
-  onSubmitReview: () => void;
+  hasUpdate?: boolean;
   sourceExpanded: boolean;
   onToggleSource: () => void;
-  token?: string | null;
   currentUserId?: string | null;
   onUnpublish?: (slug: string) => void;
   unpublishing?: boolean;
@@ -982,13 +992,6 @@ function PipeDetailPanel({
                 ) : null}
               </div>
               <div className="flex items-center gap-4 mt-2 text-sm text-muted-foreground">
-                <span className="flex items-center gap-1.5">
-                  <StarRating rating={pipe.rating ?? 0} size="md" />
-                  <span>
-                    {(pipe.rating ?? 0).toFixed(1)} ({pipe.review_count ?? 0}{" "}
-                    {(pipe.review_count ?? 0) === 1 ? "review" : "reviews"})
-                  </span>
-                </span>
                 <span className="flex items-center gap-1">
                   <Download className="h-3.5 w-3.5" />
                   {formatCount(pipe.install_count ?? 0)} installs
@@ -1000,6 +1003,31 @@ function PipeDetailPanel({
             </div>
 
             <div className="flex items-center gap-2 flex-shrink-0">
+              {/* Fork — open chat with pipe content to customize */}
+              <Button
+                size="sm"
+                variant="outline"
+                className="h-9 px-4 text-sm font-semibold rounded-none uppercase tracking-wide"
+                onClick={() => {
+                  const pipeSource = pipe.source || "";
+                  navigateHomeAndPrefill({
+                    context: `the user wants to fork/customize an existing pipe from the store.
+
+here is the original pipe content (pipe.md):
+
+\`\`\`
+${pipeSource}
+\`\`\`
+
+IMPORTANT: first read the screenpipe skill file to understand how pipes work, then ask the user how they want to customize/improve this pipe for their specific needs. do NOT auto-send or auto-create — have a conversation first to understand what they want to change.`,
+                    prompt: `i want to fork the "${pipe.title}" pipe and adapt it to my needs. here is the original pipe.md:\n\n${pipeSource}`,
+                    autoSend: true,
+                  });
+                }}
+              >
+                <GitFork className="h-4 w-4 mr-1.5" />
+                FORK
+              </Button>
               {isOwner && onUnpublish && (
                 <Button
                   size="sm"
@@ -1020,21 +1048,24 @@ function PipeDetailPanel({
               )}
               <Button
                 size="sm"
-                variant={isInstalled ? "outline" : "default"}
+                variant={isInstalled && !hasUpdate ? "outline" : "default"}
                 className={cn(
                   "h-9 px-5 text-sm font-semibold rounded-none uppercase tracking-wide flex-shrink-0",
-                  isInstalled && "pointer-events-none"
+                  isInstalled && !hasUpdate && "pointer-events-none",
+                  hasUpdate && "bg-amber-500 hover:bg-amber-600 text-white"
                 )}
                 disabled={
-                  installing === pipe.slug || isInstalled || (needsReview && !sourceReviewed)
+                  installing === pipe.slug || (isInstalled && !hasUpdate) || (needsReview && !sourceReviewed)
                 }
                 onClick={() => onInstall(pipe.slug)}
               >
                 {installing === pipe.slug ? (
                   <>
                     <Loader2 className="h-4 w-4 animate-spin mr-1.5" />
-                    INSTALLING...
+                    {hasUpdate ? "UPDATING..." : "INSTALLING..."}
                   </>
+                ) : hasUpdate ? (
+                  "UPDATE"
                 ) : isInstalled ? (
                   "INSTALLED"
                 ) : (
@@ -1058,7 +1089,7 @@ function PipeDetailPanel({
           {readmeContent ? (
             <MemoizedReactMarkdown
               remarkPlugins={[remarkGfm]}
-              className="prose prose-sm dark:prose-invert max-w-none"
+              className="prose prose-sm dark:prose-invert max-w-none prose-pre:bg-muted prose-pre:text-foreground prose-pre:rounded-md prose-pre:border prose-pre:border-border prose-pre:text-xs prose-code:bg-muted prose-code:text-foreground prose-code:px-1.5 prose-code:py-0.5 prose-code:rounded prose-code:text-xs prose-code:before:content-none prose-code:after:content-none"
               components={{
                 a: ({ href, children }) => (
                   <a
@@ -1070,20 +1101,6 @@ function PipeDetailPanel({
                     {children}
                   </a>
                 ),
-                code: ({ className, children, ...props }) => {
-                  const isInline = !className;
-                  return isInline ? (
-                    <code className="bg-muted text-foreground px-1.5 py-0.5 rounded-none text-xs" {...props}>
-                      {children}
-                    </code>
-                  ) : (
-                    <pre className="bg-muted text-foreground p-4 rounded-none overflow-x-auto text-xs">
-                      <code className={className} {...props}>
-                        {children}
-                      </code>
-                    </pre>
-                  );
-                },
               }}
             >
               {readmeContent}
@@ -1165,92 +1182,6 @@ function PipeDetailPanel({
         )}
       </div>
 
-      {/* Reviews */}
-      <div className="space-y-3">
-        <h4 className="text-xs font-medium text-muted-foreground uppercase tracking-widest">
-          Reviews ({pipe.review_count ?? 0})
-        </h4>
-        <div className="space-y-3">
-          {pipe.reviews && pipe.reviews.length > 0 ? (
-            pipe.reviews.map((review) => (
-              <div
-                key={review.id}
-                className="border border-border rounded-none p-4 space-y-1.5"
-              >
-                <div className="flex items-center gap-2">
-                  <StarRating rating={review.rating} />
-                  <span className="text-xs font-medium">{review.author}</span>
-                  <span className="text-xs text-muted-foreground">
-                    {relativeDate(review.created_at)}
-                  </span>
-                </div>
-                {review.comment && (
-                  <p className="text-sm text-muted-foreground leading-relaxed">
-                    {review.comment}
-                  </p>
-                )}
-              </div>
-            ))
-          ) : (
-            <p className="text-sm text-muted-foreground">no reviews yet</p>
-          )}
-
-          {/* Write review */}
-          {token ? (
-            <div>
-              <button
-                onClick={onToggleReview}
-                className="text-sm text-muted-foreground hover:text-foreground transition-colors underline underline-offset-2"
-              >
-                {reviewExpanded ? "cancel review" : "write a review"}
-              </button>
-              {reviewExpanded && (
-                <div className="mt-3 space-y-3 border border-border rounded-none p-4">
-                  <div>
-                    <Label className="text-xs">rating</Label>
-                    <div className="mt-1">
-                      <StarRating
-                        rating={reviewRating}
-                        size="md"
-                        interactive
-                        onChange={onReviewRatingChange}
-                      />
-                    </div>
-                  </div>
-                  <div>
-                    <Label className="text-xs">comment (optional)</Label>
-                    <Textarea
-                      value={reviewComment}
-                      onChange={(e) => onReviewCommentChange(e.target.value)}
-                      placeholder="your experience with this pipe..."
-                      className="text-sm min-h-[80px] mt-1"
-                    />
-                  </div>
-                  <Button
-                    size="sm"
-                    onClick={onSubmitReview}
-                    disabled={reviewRating === 0 || submittingReview}
-                  >
-                    {submittingReview ? (
-                      <>
-                        <Loader2 className="h-3 w-3 animate-spin mr-1.5" />
-                        SUBMITTING...
-                      </>
-                    ) : (
-                      "SUBMIT REVIEW"
-                    )}
-                  </Button>
-                </div>
-              )}
-            </div>
-          ) : (
-            <p className="text-sm text-muted-foreground">
-              sign in to write a review
-            </p>
-          )}
-        </div>
-      </div>
-
       {/* Source */}
       <div className="space-y-3">
         <button
@@ -1304,21 +1235,23 @@ function redactSecrets(text: string): { redacted: string; count: number } {
   return { redacted: result, count };
 }
 
-function PublishDialog({
+export function PublishDialog({
   open,
   onOpenChange,
   token,
   onPublished,
+  defaultPipe,
 }: {
   open: boolean;
   onOpenChange: (v: boolean) => void;
   token?: string | null;
   onPublished: () => void;
+  defaultPipe?: string;
 }) {
   const { toast } = useToast();
   const [localPipes, setLocalPipes] = useState<LocalPipe[]>([]);
   const [loadingPipes, setLoadingPipes] = useState(false);
-  const [selectedPipe, setSelectedPipe] = useState("");
+  const [selectedPipe, setSelectedPipe] = useState(defaultPipe || "");
   const [title, setTitle] = useState("");
   const [description, setDescription] = useState("");
   const [icon, setIcon] = useState("🔧");
@@ -1328,6 +1261,7 @@ function PublishDialog({
 
   useEffect(() => {
     if (!open) return;
+    if (defaultPipe) setSelectedPipe(defaultPipe);
     setLoadingPipes(true);
     fetch("http://localhost:3030/pipes")
       .then((r) => r.json())
@@ -1337,7 +1271,7 @@ function PublishDialog({
       })
       .catch(() => setLocalPipes([]))
       .finally(() => setLoadingPipes(false));
-  }, [open]);
+  }, [open, defaultPipe]);
 
   const handlePublish = async () => {
     if (!selectedPipe || !title) return;
@@ -1472,7 +1406,7 @@ function PublishDialog({
                     <SelectValue />
                   </SelectTrigger>
                   <SelectContent>
-                    {CATEGORIES.filter((c) => c !== "All").map((c) => (
+                    {PUBLISH_CATEGORIES.map((c) => (
                       <SelectItem key={c} value={c}>
                         {c}
                       </SelectItem>

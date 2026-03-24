@@ -27,8 +27,8 @@ use screenpipe_engine::{
         Cli, CliAudioTranscriptionEngine, Command,
     },
     hot_frame_cache::HotFrameCache,
-    start_meeting_persister, start_meeting_watcher, start_power_manager, start_sleep_monitor,
-    start_speaker_identification, start_ui_recording,
+    start_meeting_watcher, start_power_manager, start_sleep_monitor, start_speaker_identification,
+    start_ui_recording,
     vision_manager::{start_monitor_watcher, stop_monitor_watcher, VisionManager},
     watch_pid, ResourceMonitor, SCServer,
 };
@@ -279,6 +279,14 @@ async fn main() -> anyhow::Result<()> {
             screenpipe_engine::cli::vault::handle_vault_command(subcommand).await?;
             return Ok(());
         }
+        Command::Login => {
+            screenpipe_engine::cli::login::handle_login_command().await?;
+            return Ok(());
+        }
+        Command::Whoami => {
+            screenpipe_engine::cli::login::handle_whoami_command().await?;
+            return Ok(());
+        }
         Command::Record(args) => args,
     };
 
@@ -435,11 +443,6 @@ async fn main() -> anyhow::Result<()> {
 
     let mut audio_devices = Vec::new();
 
-    // Auto-detect realtime audio: enable for cloud engines (Deepgram)
-    use screenpipe_audio::core::engine::AudioTranscriptionEngine;
-    let enable_realtime_audio =
-        config.audio_transcription_engine == AudioTranscriptionEngine::Deepgram;
-
     if !config.disable_audio {
         if config.audio_devices.is_empty() {
             // Use default devices
@@ -545,12 +548,10 @@ async fn main() -> anyhow::Result<()> {
         Some(detector)
     };
 
-    let mut audio_manager_builder = config
-        .to_audio_manager_builder(
-            PathBuf::from(output_path_clone.clone().to_string()),
-            audio_devices,
-        )
-        .realtime(enable_realtime_audio);
+    let mut audio_manager_builder = config.to_audio_manager_builder(
+        PathBuf::from(output_path_clone.clone().to_string()),
+        audio_devices,
+    );
 
     if let Some(ref detector) = meeting_detector {
         audio_manager_builder = audio_manager_builder.meeting_detector(detector.clone());
@@ -710,7 +711,7 @@ async fn main() -> anyhow::Result<()> {
     // Create pipe store backed by the main SQLite DB
     let pipe_store: Option<std::sync::Arc<dyn screenpipe_core::pipes::PipeStore>> =
         Some(std::sync::Arc::new(
-            screenpipe_engine::pipe_store::SqlitePipeStore::new(db.pool.clone()),
+            screenpipe_engine::pipe_store::SqlitePipeStore::new(db.clone()),
         ));
 
     let mut pipe_manager = screenpipe_core::pipes::PipeManager::new(
@@ -1004,21 +1005,18 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
-    // Start meeting watcher (standalone accessibility listener for smart mode)
+    // Start v2 meeting detection (UI scanning for call controls)
     // Independent of enable_input_capture/enable_accessibility — only needs accessibility permission
-    let _meeting_watcher_handle = meeting_detector
-        .as_ref()
-        .map(|detector| start_meeting_watcher(detector.clone()));
-
-    // Persist meeting state transitions to DB (smart mode only)
-    let _meeting_persister_handle = meeting_detector.as_ref().map(|detector| {
-        start_meeting_persister(detector.clone(), db.clone(), manual_meeting.clone())
-    });
-
-    // Bridge calendar events from event bus into meeting detector
-    let _calendar_bridge_handle = meeting_detector
-        .as_ref()
-        .map(|detector| screenpipe_engine::start_calendar_bridge(detector.clone()));
+    let _meeting_watcher_handle = {
+        let v2_in_meeting = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        start_meeting_watcher(
+            db.clone(),
+            v2_in_meeting,
+            manual_meeting.clone(),
+            shutdown_tx.subscribe(),
+            meeting_detector.clone(),
+        )
+    };
 
     // Start calendar-assisted speaker identification
     let _speaker_id_handle = start_speaker_identification(db.clone(), config.user_name.clone());

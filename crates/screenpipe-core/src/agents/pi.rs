@@ -13,68 +13,38 @@ use serde_json::json;
 use std::path::{Path, PathBuf};
 use tracing::{debug, error, info, warn};
 
-const PI_PACKAGE: &str = "@mariozechner/pi-coding-agent@0.57.1";
+const PI_PACKAGE: &str = "@mariozechner/pi-coding-agent@0.60.0";
 pub const SCREENPIPE_API_URL: &str = "https://api.screenpi.pe/v1";
 
 /// Returns the screenpipe cloud models array as a serde_json::Value.
 /// Shared between server-side pipe executor and desktop Pi chat so the
 /// model list stays in sync.
+/// Full model catalog matching the Cloudflare Worker gateway.
+/// Must stay in sync with packages/ai-gateway/src/handlers/models.ts.
 pub fn screenpipe_cloud_models() -> serde_json::Value {
     json!([
-        {
-            "id": "claude-opus-4-6",
-            "name": "Claude Opus 4.6",
-            "reasoning": true,
-            "input": ["text", "image"],
-            "cost": {"input": 15, "output": 75, "cacheRead": 1.5, "cacheWrite": 18.75},
-            "contextWindow": 200000,
-            "maxTokens": 32000
-        },
-        {
-            "id": "claude-sonnet-4-5",
-            "name": "Claude Sonnet 4.5",
-            "reasoning": true,
-            "input": ["text", "image"],
-            "cost": {"input": 3, "output": 15, "cacheRead": 0.3, "cacheWrite": 3.75},
-            "contextWindow": 200000,
-            "maxTokens": 64000
-        },
-        {
-            "id": "claude-opus-4-5@20251101",
-            "name": "Claude Opus 4.5",
-            "reasoning": true,
-            "input": ["text", "image"],
-            "cost": {"input": 15, "output": 75, "cacheRead": 1.5, "cacheWrite": 18.75},
-            "contextWindow": 200000,
-            "maxTokens": 32000
-        },
-        {
-            "id": "claude-haiku-4-5",
-            "name": "Claude Haiku 4.5",
-            "reasoning": true,
-            "input": ["text", "image"],
-            "cost": {"input": 0.8, "output": 4, "cacheRead": 0.08, "cacheWrite": 1},
-            "contextWindow": 200000,
-            "maxTokens": 64000
-        },
-        {
-            "id": "gemini-3-flash",
-            "name": "Gemini 3 Flash",
-            "reasoning": false,
-            "input": ["text", "image"],
-            "cost": {"input": 0.10, "output": 0.40, "cacheRead": 0, "cacheWrite": 0},
-            "contextWindow": 1000000,
-            "maxTokens": 65536
-        },
-        {
-            "id": "gemini-3.1-pro",
-            "name": "Gemini 3.1 Pro",
-            "reasoning": true,
-            "input": ["text", "image"],
-            "cost": {"input": 1.25, "output": 10.00, "cacheRead": 0, "cacheWrite": 0},
-            "contextWindow": 1000000,
-            "maxTokens": 65536
-        }
+        // ── Free models (Vertex AI MaaS — GCP credits, free for users) ──
+        {"id": "glm-4.7", "name": "GLM-4.7", "reasoning": true, "input": ["text"], "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0}, "contextWindow": 200000, "maxTokens": 32000},
+        {"id": "glm-5", "name": "GLM-5", "reasoning": true, "input": ["text"], "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0}, "contextWindow": 128000, "maxTokens": 32000},
+        {"id": "kimi-k2.5", "name": "Kimi K2.5", "reasoning": true, "input": ["text"], "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0}, "contextWindow": 128000, "maxTokens": 32000},
+        // ── Free models (OpenRouter / Gemini) ──
+        {"id": "qwen/qwen3-coder:free", "name": "Qwen3 Coder 480B", "reasoning": true, "input": ["text"], "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0}, "contextWindow": 262000, "maxTokens": 32000},
+        {"id": "stepfun/step-3.5-flash:free", "name": "Step 3.5 Flash", "reasoning": false, "input": ["text"], "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0}, "contextWindow": 256000, "maxTokens": 32000},
+        {"id": "gemini-3-flash", "name": "Gemini 3 Flash", "reasoning": false, "input": ["text", "image"], "cost": {"input": 0.10, "output": 0.40, "cacheRead": 0, "cacheWrite": 0}, "contextWindow": 1000000, "maxTokens": 65536},
+        {"id": "gemini-2.5-flash", "name": "Gemini 2.5 Flash", "reasoning": false, "input": ["text", "image"], "cost": {"input": 0.075, "output": 0.30, "cacheRead": 0, "cacheWrite": 0}, "contextWindow": 1000000, "maxTokens": 65536},
+        // ── Anthropic ──
+        {"id": "claude-opus-4-6", "name": "Claude Opus 4.6", "reasoning": true, "input": ["text", "image"], "cost": {"input": 15, "output": 75, "cacheRead": 1.5, "cacheWrite": 18.75}, "contextWindow": 200000, "maxTokens": 32000},
+        {"id": "claude-sonnet-4-5", "name": "Claude Sonnet 4.5", "reasoning": true, "input": ["text", "image"], "cost": {"input": 3, "output": 15, "cacheRead": 0.3, "cacheWrite": 3.75}, "contextWindow": 200000, "maxTokens": 64000},
+        {"id": "claude-haiku-4-5", "name": "Claude Haiku 4.5", "reasoning": true, "input": ["text", "image"], "cost": {"input": 0.8, "output": 4, "cacheRead": 0.08, "cacheWrite": 1}, "contextWindow": 200000, "maxTokens": 64000},
+        // ── OpenRouter ──
+        {"id": "qwen/qwen3.5-flash-02-23", "name": "Qwen3.5 Flash", "reasoning": false, "input": ["text"], "cost": {"input": 0.065, "output": 0.26, "cacheRead": 0, "cacheWrite": 0}, "contextWindow": 1000000, "maxTokens": 32000},
+        {"id": "deepseek/deepseek-chat", "name": "DeepSeek V3.2", "reasoning": true, "input": ["text"], "cost": {"input": 0.26, "output": 0.38, "cacheRead": 0, "cacheWrite": 0}, "contextWindow": 128000, "maxTokens": 32000},
+        {"id": "deepseek/deepseek-v3.2-speciale", "name": "DeepSeek V3.2 Speciale", "reasoning": true, "input": ["text"], "cost": {"input": 2.19, "output": 8.76, "cacheRead": 0, "cacheWrite": 0}, "contextWindow": 128000, "maxTokens": 32000},
+        {"id": "qwen/qwen3.5-397b-a17b", "name": "Qwen3.5 397B", "reasoning": true, "input": ["text", "image"], "cost": {"input": 1.50, "output": 3.00, "cacheRead": 0, "cacheWrite": 0}, "contextWindow": 131000, "maxTokens": 32000},
+        {"id": "meta-llama/llama-4-scout", "name": "Llama 4 Scout", "reasoning": false, "input": ["text"], "cost": {"input": 0.11, "output": 0.34, "cacheRead": 0, "cacheWrite": 0}, "contextWindow": 512000, "maxTokens": 32000},
+        {"id": "meta-llama/llama-4-maverick", "name": "Llama 4 Maverick", "reasoning": true, "input": ["text"], "cost": {"input": 0.50, "output": 0.77, "cacheRead": 0, "cacheWrite": 0}, "contextWindow": 256000, "maxTokens": 32000},
+        // ── Google ──
+        {"id": "gemini-3.1-pro", "name": "Gemini 3.1 Pro", "reasoning": true, "input": ["text", "image"], "cost": {"input": 1.25, "output": 10.00, "cacheRead": 0, "cacheWrite": 0}, "contextWindow": 1000000, "maxTokens": 65536},
     ])
 }
 
@@ -224,6 +194,18 @@ impl PiExecutor {
 
     /// Install the context-pruning extension that truncates large tool results
     /// to prevent unbounded context growth in --continue sessions.
+    /// Install orphan guard extension — kills bun if the parent (screenpipe) dies.
+    /// Always installed for every pipe and chat session.
+    pub fn ensure_orphan_guard_extension(project_dir: &Path) -> Result<()> {
+        let ext_dir = project_dir.join(".pi").join("extensions");
+        std::fs::create_dir_all(&ext_dir)?;
+        let ext_content = include_str!("../../assets/extensions/orphan-guard.ts");
+        let ext_path = ext_dir.join("orphan-guard.ts");
+        std::fs::write(&ext_path, ext_content)?;
+        debug!("orphan-guard extension installed at {:?}", ext_path);
+        Ok(())
+    }
+
     pub fn ensure_context_pruning_extension(project_dir: &Path) -> Result<()> {
         let ext_dir = project_dir.join(".pi").join("extensions");
         std::fs::create_dir_all(&ext_dir)?;
@@ -234,18 +216,22 @@ impl PiExecutor {
         Ok(())
     }
 
-    /// Install or remove the web-search extension based on provider.
+    /// Install or remove the web-search extension based on provider and offline mode.
     /// Web search uses the screenpipe cloud backend, so we only enable it
     /// for screenpipe-cloud to avoid sending data to our backend when the
-    /// user chose a local/custom provider.
+    /// user chose a local/custom provider. Always removed in offline mode.
     pub fn ensure_web_search_extension(project_dir: &Path, provider: Option<&str>) -> Result<()> {
         let ext_dir = project_dir.join(".pi").join("extensions");
         let ext_path = ext_dir.join("web-search.ts");
 
-        let is_screenpipe_cloud = matches!(
-            provider,
-            None | Some("screenpipe") | Some("screenpipe-cloud") | Some("pi")
-        );
+        // Offline mode: never install web search (it calls api.screenpi.pe)
+        let offline = crate::offline::is_offline_mode();
+
+        let is_screenpipe_cloud = !offline
+            && matches!(
+                provider,
+                None | Some("screenpipe") | Some("screenpipe-cloud") | Some("pi")
+            );
 
         if is_screenpipe_cloud {
             std::fs::create_dir_all(&ext_dir)?;
@@ -295,10 +281,16 @@ impl PiExecutor {
         // Only add screenpipe cloud provider if it's the intended provider
         // (or no provider specified). If the user explicitly chose ollama/openai/custom,
         // do NOT write screenpipe into models.json to avoid silent credit drain via fallback.
-        let should_add_screenpipe = match provider {
-            None => true,
-            Some("screenpipe") | Some("screenpipe-cloud") | Some("pi") => true,
-            Some(_) => false,
+        // Offline mode: never add screenpipe cloud provider.
+        let offline = crate::offline::is_offline_mode();
+        let should_add_screenpipe = if offline {
+            false
+        } else {
+            match provider {
+                None => true,
+                Some("screenpipe") | Some("screenpipe-cloud") | Some("pi") => true,
+                Some(_) => false,
+            }
         };
 
         if should_add_screenpipe {
@@ -386,8 +378,17 @@ impl PiExecutor {
             }
         }
 
-        // Atomic write: write to temp file then rename to prevent partial reads
-        let models_tmp = config_dir.join("models.json.tmp");
+        // Atomic write: write to unique temp file then rename to prevent partial reads.
+        // Use a unique suffix to avoid races when multiple pipes call this concurrently
+        // (all pipes share this process, so PID alone isn't enough).
+        let models_tmp = config_dir.join(format!(
+            "models.json.{}.{}.tmp",
+            std::process::id(),
+            format!("{:?}", std::thread::current().id())
+                .chars()
+                .filter(|c| c.is_ascii_digit())
+                .collect::<String>()
+        ));
         std::fs::write(&models_tmp, serde_json::to_string_pretty(&models_config)?)?;
         std::fs::rename(&models_tmp, &models_path)?;
 
@@ -407,7 +408,14 @@ impl PiExecutor {
                     obj.insert("screenpipe".to_string(), json!(token));
                 }
 
-                let auth_tmp = config_dir.join("auth.json.tmp");
+                let auth_tmp = config_dir.join(format!(
+                    "auth.json.{}.{}.tmp",
+                    std::process::id(),
+                    format!("{:?}", std::thread::current().id())
+                        .chars()
+                        .filter(|c| c.is_ascii_digit())
+                        .collect::<String>()
+                ));
                 std::fs::write(&auth_tmp, serde_json::to_string_pretty(&auth)?)?;
                 std::fs::rename(&auth_tmp, &auth_path)?;
 
@@ -470,6 +478,7 @@ impl PiExecutor {
         provider_api_key: Option<&str>,
         pid_tx: Option<tokio::sync::oneshot::Sender<u32>>,
         continue_session: bool,
+        pipe_system_prompt: Option<&str>,
     ) -> Result<AgentOutput> {
         let mut cmd = build_async_command(pi_path);
         cmd.current_dir(working_dir);
@@ -481,34 +490,42 @@ impl PiExecutor {
         }
         cmd.arg("--provider").arg(resolved_provider);
         cmd.arg("--model").arg(model);
+        if let Some(sys) = pipe_system_prompt {
+            cmd.arg("--append-system-prompt").arg(sys);
+        }
         cmd.arg("-p").arg(prompt);
 
-        if let Some(ref token) = self.user_token {
-            cmd.env("SCREENPIPE_API_KEY", token);
-        }
+        // Offline mode: strip all cloud API keys to prevent external requests.
+        // Only localhost providers (ollama) work in offline mode.
+        let offline = crate::offline::is_offline_mode();
+        if !offline {
+            if let Some(ref token) = self.user_token {
+                cmd.env("SCREENPIPE_API_KEY", token);
+            }
 
-        // Pi resolves apiKey values in models.json as env var names.
-        // Set the actual key so the subprocess can find it.
-        if let Some(key) = provider_api_key {
-            if !key.is_empty() {
-                match resolved_provider {
-                    "openai" | "openai-byok" => {
-                        cmd.env("OPENAI_API_KEY", key);
+            // Pi resolves apiKey values in models.json as env var names.
+            // Set the actual key so the subprocess can find it.
+            if let Some(key) = provider_api_key {
+                if !key.is_empty() {
+                    match resolved_provider {
+                        "openai" | "openai-byok" => {
+                            cmd.env("OPENAI_API_KEY", key);
+                        }
+                        "openai-chatgpt" => {
+                            cmd.env("OPENAI_CHATGPT_TOKEN", key);
+                        }
+                        "anthropic" | "anthropic-byok" => {
+                            cmd.env("ANTHROPIC_API_KEY", key);
+                        }
+                        "custom" => {
+                            cmd.env("CUSTOM_API_KEY", key);
+                        }
+                        // Ensure screenpipe API key is set as env var fallback
+                        "screenpipe" if self.user_token.is_none() => {
+                            cmd.env("SCREENPIPE_API_KEY", key);
+                        }
+                        _ => {}
                     }
-                    "openai-chatgpt" => {
-                        cmd.env("OPENAI_CHATGPT_TOKEN", key);
-                    }
-                    "anthropic" | "anthropic-byok" => {
-                        cmd.env("ANTHROPIC_API_KEY", key);
-                    }
-                    "custom" => {
-                        cmd.env("CUSTOM_API_KEY", key);
-                    }
-                    // Ensure screenpipe API key is set as env var fallback
-                    "screenpipe" if self.user_token.is_none() => {
-                        cmd.env("SCREENPIPE_API_KEY", key);
-                    }
-                    _ => {}
                 }
             }
         }
@@ -569,6 +586,7 @@ impl PiExecutor {
         pid_tx: Option<tokio::sync::oneshot::Sender<u32>>,
         line_tx: tokio::sync::mpsc::UnboundedSender<String>,
         continue_session: bool,
+        pipe_system_prompt: Option<&str>,
     ) -> Result<AgentOutput> {
         let mut cmd = build_async_command(pi_path);
         cmd.current_dir(working_dir);
@@ -583,32 +601,41 @@ impl PiExecutor {
         }
         cmd.arg("--provider").arg(resolved_provider);
         cmd.arg("--model").arg(model);
+        // Pass pipe instructions as system prompt for Anthropic prompt caching.
+        // Pi's internal system prompt + this appended text form the cached prefix.
+        if let Some(sys) = pipe_system_prompt {
+            cmd.arg("--append-system-prompt").arg(sys);
+        }
         cmd.arg("-p").arg(prompt);
 
-        if let Some(ref token) = self.user_token {
-            cmd.env("SCREENPIPE_API_KEY", token);
-        }
+        // Offline mode: strip all cloud API keys (same logic as spawn_pi)
+        let offline = crate::offline::is_offline_mode();
+        if !offline {
+            if let Some(ref token) = self.user_token {
+                cmd.env("SCREENPIPE_API_KEY", token);
+            }
 
-        if let Some(key) = provider_api_key {
-            if !key.is_empty() {
-                match resolved_provider {
-                    "openai" | "openai-byok" => {
-                        cmd.env("OPENAI_API_KEY", key);
+            if let Some(key) = provider_api_key {
+                if !key.is_empty() {
+                    match resolved_provider {
+                        "openai" | "openai-byok" => {
+                            cmd.env("OPENAI_API_KEY", key);
+                        }
+                        "openai-chatgpt" => {
+                            cmd.env("OPENAI_CHATGPT_TOKEN", key);
+                        }
+                        "anthropic" | "anthropic-byok" => {
+                            cmd.env("ANTHROPIC_API_KEY", key);
+                        }
+                        "custom" => {
+                            cmd.env("CUSTOM_API_KEY", key);
+                        }
+                        // Ensure screenpipe API key is set as env var fallback
+                        "screenpipe" if self.user_token.is_none() => {
+                            cmd.env("SCREENPIPE_API_KEY", key);
+                        }
+                        _ => {}
                     }
-                    "openai-chatgpt" => {
-                        cmd.env("OPENAI_CHATGPT_TOKEN", key);
-                    }
-                    "anthropic" | "anthropic-byok" => {
-                        cmd.env("ANTHROPIC_API_KEY", key);
-                    }
-                    "custom" => {
-                        cmd.env("CUSTOM_API_KEY", key);
-                    }
-                    // Ensure screenpipe API key is set as env var fallback
-                    "screenpipe" if self.user_token.is_none() => {
-                        cmd.env("SCREENPIPE_API_KEY", key);
-                    }
-                    _ => {}
                 }
             }
         }
@@ -759,6 +786,7 @@ impl AgentExecutor for PiExecutor {
 
         Self::ensure_web_search_extension(working_dir, Some(&resolved_provider))?;
         Self::ensure_context_pruning_extension(working_dir)?;
+        Self::ensure_orphan_guard_extension(working_dir)?;
 
         let pi_path = find_pi_executable().ok_or_else(|| {
             anyhow!(
@@ -782,6 +810,7 @@ impl AgentExecutor for PiExecutor {
                 provider_api_key,
                 pid_tx,
                 continue_session,
+                None, // no pipe system prompt for trait-based calls
             )
             .await?;
 
@@ -812,6 +841,7 @@ impl AgentExecutor for PiExecutor {
                     provider_api_key,
                     None,
                     continue_session,
+                    None,
                 )
                 .await;
         }
@@ -830,6 +860,7 @@ impl AgentExecutor for PiExecutor {
         pid_tx: Option<tokio::sync::oneshot::Sender<u32>>,
         line_tx: tokio::sync::mpsc::UnboundedSender<String>,
         continue_session: bool,
+        pipe_system_prompt: Option<&str>,
     ) -> Result<AgentOutput> {
         let resolved_provider = provider.unwrap_or("screenpipe").to_string();
         let resolved_model = Self::resolve_model(model, &resolved_provider);
@@ -845,6 +876,7 @@ impl AgentExecutor for PiExecutor {
         Self::ensure_screenpipe_skill_auto(working_dir)?;
         Self::ensure_web_search_extension(working_dir, Some(&resolved_provider))?;
         Self::ensure_context_pruning_extension(working_dir)?;
+        Self::ensure_orphan_guard_extension(working_dir)?;
 
         let pi_path = find_pi_executable().ok_or_else(|| {
             anyhow!(
@@ -868,6 +900,7 @@ impl AgentExecutor for PiExecutor {
                 pid_tx,
                 line_tx.clone(),
                 continue_session,
+                pipe_system_prompt,
             )
             .await?;
 
@@ -898,6 +931,7 @@ impl AgentExecutor for PiExecutor {
                     None,
                     line_tx,
                     continue_session,
+                    pipe_system_prompt,
                 )
                 .await;
         }
@@ -1036,7 +1070,7 @@ fn is_local_pi_version_current() -> bool {
         Some(v) => v,
         None => return false,
     };
-    // PI_PACKAGE is "@mariozechner/pi-coding-agent@0.57.1" — extract version after last '@'
+    // PI_PACKAGE is "@mariozechner/pi-coding-agent@0.60.0" — extract version after last '@'
     let expected = PI_PACKAGE.rsplit('@').next().unwrap_or("");
     if installed != expected {
         info!(
@@ -1249,7 +1283,51 @@ fn build_async_command(path: &str) -> tokio::process::Command {
         if let Some(bun_path) = find_bun_executable() {
             if let Some(bun_dir) = std::path::Path::new(&bun_path).parent() {
                 let current_path = std::env::var("PATH").unwrap_or_default();
-                let new_path = format!("{};{}", bun_dir.display(), current_path);
+                let mut new_path = format!("{};{}", bun_dir.display(), current_path);
+
+                // On Windows, inject bash into PATH for Pi's bash tool.
+                // Check bundled PortableGit, then standard Git for Windows paths.
+                {
+                    let bash_dirs: Vec<std::path::PathBuf> = {
+                        let mut dirs = Vec::new();
+                        // 1. Bundled PortableGit
+                        if let Some(local_app_data) = std::env::var_os("LOCALAPPDATA") {
+                            let bundled = std::path::PathBuf::from(&local_app_data)
+                                .join("screenpipe")
+                                .join("git-portable")
+                                .join("bin");
+                            if bundled.join("bash.exe").exists() {
+                                dirs.push(bundled);
+                            }
+                        }
+                        // 2. Standard Git for Windows
+                        if dirs.is_empty() {
+                            for p in &[
+                                r"C:\Program Files\Git\bin",
+                                r"C:\Program Files (x86)\Git\bin",
+                            ] {
+                                let dir = std::path::PathBuf::from(p);
+                                if dir.join("bash.exe").exists() {
+                                    dirs.push(dir);
+                                    break;
+                                }
+                            }
+                        }
+                        dirs
+                    };
+                    if let Some(bash_dir) = bash_dirs.first() {
+                        new_path = format!("{};{}", bash_dir.display(), new_path);
+                        // Also add usr/bin for common unix utils (grep, cat, etc.)
+                        if let Some(parent) = bash_dir.parent() {
+                            let usr_bin = parent.join("usr").join("bin");
+                            if usr_bin.exists() {
+                                new_path = format!("{};{}", usr_bin.display(), new_path);
+                            }
+                        }
+                        debug!("injected bash dir into PATH for pi: {}", bash_dir.display());
+                    }
+                }
+
                 cmd.env("PATH", new_path);
                 debug!("injected bun dir into PATH for pi: {}", bun_dir.display());
             }

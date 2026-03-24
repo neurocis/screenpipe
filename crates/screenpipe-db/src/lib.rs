@@ -7,10 +7,11 @@ pub mod text_normalizer;
 pub mod text_similarity;
 mod types;
 mod video_db;
-pub(crate) mod write_queue;
+pub mod write_queue;
 
 pub use db::{
     find_matching_a11y_positions, parse_all_text_positions, DatabaseManager, DeleteTimeRangeResult,
+    ImmediateTx,
 };
 pub use migration_worker::{
     create_migration_worker, MigrationCommand, MigrationConfig, MigrationResponse, MigrationStatus,

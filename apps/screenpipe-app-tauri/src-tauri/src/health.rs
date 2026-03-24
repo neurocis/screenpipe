@@ -8,7 +8,7 @@ use once_cell::sync::Lazy;
 use serde::Deserialize;
 use std::sync::RwLock;
 use std::time::Instant;
-use tauri::{path::BaseDirectory, Manager};
+use tauri::{path::BaseDirectory, Emitter, Manager};
 use tokio::time::{interval, Duration};
 use tracing::{error, info, warn};
 
@@ -144,6 +144,9 @@ struct HealthCheckResponse {
     /// Audio devices active but DB writes stopped (pool exhaustion)
     #[serde(default)]
     audio_db_write_stalled: bool,
+    /// DRM streaming content detected — capture should be fully stopped
+    #[serde(default)]
+    drm_content_paused: bool,
 }
 
 /// Decide recording status based on health check result and time since startup.
@@ -292,8 +295,8 @@ fn parse_devices_from_health(health_result: &Result<HealthCheckResponse>) -> Vec
 }
 
 /// How many consecutive stale/not_started checks before showing a notification.
-/// At 1-second polling, 30 = 30 seconds of sustained failure.
-const CAPTURE_STALL_THRESHOLD: u32 = 30;
+/// At 1-second polling, 90 = 90 seconds of sustained failure.
+const CAPTURE_STALL_THRESHOLD: u32 = 90;
 
 /// Suppress re-notification for this long after showing one.
 const NOTIFICATION_COOLDOWN: Duration = Duration::from_secs(300); // 5 minutes
@@ -309,6 +312,9 @@ pub async fn start_health_check(app: tauri::AppHandle) -> Result<()> {
     let mut ever_connected = false;
     let mut consecutive_failures: u32 = 0;
     let mut consecutive_unhealthy: u32 = 0;
+
+    // DRM pause state — tracked here because engine memory is lost on stop_screenpipe
+    let mut drm_stopped = false;
 
     // Capture stall detection state
     let mut consecutive_audio_stall: u32 = 0;
@@ -465,6 +471,46 @@ pub async fn start_health_check(app: tauri::AppHandle) -> Result<()> {
                 }
             }
 
+            // ── DRM content pause / resume ──
+            // When the engine detects DRM streaming content (Netflix, etc.),
+            // stop the entire recording pipeline — exactly like the "stop recording"
+            // button. This fully releases ScreenCaptureKit so DRM doesn't black out.
+            if let Ok(ref health) = health_result {
+                if health.drm_content_paused && !drm_stopped {
+                    info!("DRM content detected — calling stop_screenpipe to fully release screen recording");
+                    let _ = app.emit("shortcut-stop-recording", ());
+                    drm_stopped = true;
+                }
+            }
+            // Auto-resume: when server is down due to DRM, poll the focused app.
+            // If user switched to a non-streaming, non-browser app, restart recording.
+            // Also try when server responds (it may still be shutting down).
+            if drm_stopped {
+                info!("DRM stopped state active, health_ok={}, checking focused app for resume", health_result.is_ok());
+            }
+            if drm_stopped {
+                let should_resume = tokio::task::spawn_blocking(|| {
+                    // poll_drm_clear returns true = still DRM, false = cleared
+                    !screenpipe_engine::drm_detector::poll_drm_clear()
+                }).await.unwrap_or(false);
+                if should_resume {
+                    info!("DRM content no longer focused — auto-restarting recording");
+                    let _ = app.emit("shortcut-start-recording", ());
+                    drm_stopped = false;
+                    // Give the server time to start before checking health again
+                    last_restart_triggered = Some(Instant::now());
+                }
+            }
+            // Clear drm_stopped if server came back and DRM flag is no longer set
+            // (e.g. user manually started recording or toggled the setting off)
+            if drm_stopped && health_result.is_ok() {
+                if let Ok(ref health) = health_result {
+                    if !health.drm_content_paused {
+                        drm_stopped = false;
+                    }
+                }
+            }
+
             // ── Capture stall detection ──
             // Only check when the server is responding (status == Recording),
             // we're past the startup grace period, and not in a post-restart
@@ -546,7 +592,7 @@ pub async fn start_health_check(app: tauri::AppHandle) -> Result<()> {
                         .ok()
                         .flatten()
                         .map(|s| s.show_restart_notifications)
-                        .unwrap_or(true);
+                        .unwrap_or(false);
                     let now_instant = Instant::now();
 
                     if consecutive_audio_stall == CAPTURE_STALL_THRESHOLD && notifications_enabled {
@@ -605,8 +651,8 @@ async fn show_capture_stall_notification(app: &tauri::AppHandle, system: &str) -
     let payload = serde_json::json!({
         "id": format!("capture_stall_{}", system),
         "type": "capture_stall",
-        "title": format!("{} recording stopped", system),
-        "body": format!("{} capture appears to have stopped. you can restart to fix this.", system),
+        "title": format!("{} capture may be stalled", system),
+        "body": format!("screenpipe has not received recent {} updates. this may recover on its own, but restarting usually fixes it.", system),
         "actions": [
             { "label": "RESTART", "action": "restart_recording", "primary": true }
         ],

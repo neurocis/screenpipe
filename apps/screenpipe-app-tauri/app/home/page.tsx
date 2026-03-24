@@ -30,6 +30,7 @@ import {
   PanelLeftOpen,
   Phone,
   Sparkles,
+  Bell,
 } from "lucide-react";
 import { useOverlayData } from "@/app/shortcut-reminder/use-overlay-data";
 import { cn } from "@/lib/utils";
@@ -48,13 +49,14 @@ import { PrivacySection } from "@/components/settings/privacy-section";
 import { StorageSection } from "@/components/settings/storage-section";
 import { MeetingsSection } from "@/components/settings/meetings-section";
 import { MemoriesSection } from "@/components/settings/memories-section";
+import { NotificationsSettings } from "@/components/settings/notifications-settings";
 import { StandaloneChat } from "@/components/standalone-chat";
 import Timeline from "@/components/rewind/timeline";
 import { useQueryState } from "nuqs";
 import { listen } from "@tauri-apps/api/event";
 import { useSettings } from "@/lib/hooks/use-settings";
 import { useTeam } from "@/lib/hooks/use-team";
-import { useIsEnterpriseBuild } from "@/lib/hooks/use-is-enterprise-build";
+import { useEnterprisePolicy } from "@/lib/hooks/use-enterprise-policy";
 import { open as openUrl } from "@tauri-apps/plugin-shell";
 import { commands } from "@/lib/utils/tauri";
 import { toast } from "@/components/ui/use-toast";
@@ -81,19 +83,27 @@ type SettingsModalSection =
   | "meetings"
   | "memories"
   | "team"
+  | "notifications"
   | "referral";
+
+type SettingsModalSectionItem = {
+  id: SettingsModalSection;
+  label: string;
+  icon: React.ReactNode;
+  group?: string;
+};
 
 // All valid URL sections (main + modal)
 const ALL_SECTIONS = [
   "home", "timeline", "pipes", "help",
-  "account", "recording", "ai", "general", "display", "shortcuts",
+  "account", "recording", "ai", "general", "display", "shortcuts", "notifications",
   "connections", "privacy", "storage", "meetings", "memories", "team", "referral",
   "feedback", // backwards compat → maps to "help"
   "disk-usage", "cloud-archive", "cloud-sync", // backwards compat → maps to "storage"
 ];
 
 const MODAL_SECTIONS = new Set<string>([
-  "account", "recording", "ai", "general", "display", "shortcuts",
+  "account", "recording", "ai", "general", "display", "shortcuts", "notifications",
   "connections", "privacy", "storage", "meetings", "memories", "team", "referral",
 ]);
 
@@ -110,7 +120,7 @@ function SettingsPageContent() {
 
   const { settings } = useSettings();
   const teamState = useTeam();
-  const isEnterprise = useIsEnterpriseBuild();
+  const { isSectionHidden } = useEnterprisePolicy();
 
   // Sidebar collapse state (persisted in localStorage)
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
@@ -196,7 +206,7 @@ function SettingsPageContent() {
         .then((meetings: { meeting_end: string | null; detection_source: string }[]) => {
           if (cancelled) return;
           const hasActive = meetings.some(
-            (m) => m.meeting_end === null && m.detection_source === "manual"
+            (m) => m.meeting_end === null
           );
           setManualMeeting(hasActive);
         })
@@ -306,35 +316,39 @@ function SettingsPageContent() {
         return <ConnectionsSection />;
       case "team":
         return <TeamSection />;
+      case "notifications":
+        return <NotificationsSettings />;
       case "referral":
         return <ReferralSection />;
     }
   };
 
-  // Top-level nav items
+  // Top-level nav items (filtered by enterprise policy)
   const mainSections = [
     { id: "home", label: "Home", icon: <Home className="h-4 w-4" /> },
     { id: "pipes", label: "Pipes", icon: <Workflow className="h-4 w-4" /> },
     { id: "timeline", label: "Timeline", icon: <Clock className="h-4 w-4" /> },
-  ];
+  ].filter((s) => !isSectionHidden(s.id));
 
-  // Settings modal sidebar items
-  const settingsModalSections: { id: SettingsModalSection; label: string; icon: React.ReactNode; group?: string }[] = [
-    { id: "general", label: "General", icon: <SettingsIcon className="h-4 w-4" />, group: "app" },
+  // Settings modal sidebar items (filtered by enterprise policy)
+  const settingsModalSections = ([
     { id: "display", label: "Display", icon: <Layout className="h-4 w-4" />, group: "app" },
+    { id: "general", label: "General", icon: <SettingsIcon className="h-4 w-4" />, group: "app" },
+    { id: "ai", label: "AI models", icon: <Brain className="h-4 w-4" />, group: "app" },
     { id: "recording", label: "Recording", icon: <Video className="h-4 w-4" />, group: "app" },
     { id: "dictation", label: "Dictation", icon: <Headset className="h-4 w-4" />, group: "app" },
     { id: "ai", label: "AI models", icon: <Brain className="h-4 w-4" />, group: "app" },
     { id: "shortcuts", label: "Shortcuts", icon: <Keyboard className="h-4 w-4" />, group: "app" },
+    { id: "notifications", label: "Notifications", icon: <Bell className="h-4 w-4" />, group: "app" },
     { id: "privacy", label: "Privacy", icon: <Shield className="h-4 w-4" />, group: "data" },
     { id: "storage", label: "Storage", icon: <HardDrive className="h-4 w-4" />, group: "data" },
-    { id: "connections", label: "Connections", icon: <Plug className="h-4 w-4" />, group: "data" },
     { id: "meetings", label: "Meetings", icon: <Phone className="h-4 w-4" />, group: "data" },
     { id: "memories", label: "Memories", icon: <Sparkles className="h-4 w-4" />, group: "data" },
-    ...(!isEnterprise ? [{ id: "account" as SettingsModalSection, label: "Account", icon: <User className="h-4 w-4" />, group: "account" }] : []),
+    { id: "connections", label: "Connections", icon: <Plug className="h-4 w-4" />, group: "data" },
     { id: "team", label: "Team", icon: <Users className="h-4 w-4" />, group: "account" },
-    ...(!isEnterprise ? [{ id: "referral" as SettingsModalSection, label: "Get free month", icon: <Gift className="h-4 w-4" />, group: "account" }] : []),
-  ];
+    { id: "account", label: "Account", icon: <User className="h-4 w-4" />, group: "account" },
+    { id: "referral", label: "Get free month", icon: <Gift className="h-4 w-4" />, group: "account" },
+  ] satisfies SettingsModalSectionItem[]).filter((s) => !isSectionHidden(s.id));
 
   const appGroup = settingsModalSections.filter(s => s.group === "app");
   const dataGroup = settingsModalSections.filter(s => s.group === "data");
@@ -361,7 +375,7 @@ function SettingsPageContent() {
   const isFullHeight = activeSection === "home" || activeSection === "timeline";
 
   return (
-    <div className={cn("bg-background", isFullHeight ? "h-screen overflow-hidden" : "min-h-screen")}>
+    <div className={cn("bg-background", isFullHeight ? "h-screen overflow-hidden" : "min-h-screen")} data-testid="home-page">
       {/* Transparent titlebar area */}
       <div className="h-8 bg-transparent" data-tauri-drag-region></div>
 
@@ -375,62 +389,71 @@ function SettingsPageContent() {
               sidebarCollapsed ? "w-14" : "w-56",
             )}
           >
-            <div className={cn("py-3 border-b flex items-center overflow-hidden", sidebarCollapsed ? "px-2 justify-center" : "px-4 justify-between gap-2")}>
-              {!sidebarCollapsed && <h1 className="text-lg font-bold text-foreground truncate min-w-0">screenpipe</h1>}
-              <div className="flex items-center gap-2 flex-shrink-0">
-                {!sidebarCollapsed && (() => {
-                  const monitors = recordingDevices.filter((d) => d.kind === "monitor");
-                  const inputs = recordingDevices.filter((d) => d.kind === "input");
-                  const outputs = recordingDevices.filter((d) => d.kind === "output");
-                  const screenOpacity = overlayData.screenActive ? 0.5 + Math.min(overlayData.captureFps / 2, 0.5) : 0.2;
-                  const audioOpacity = overlayData.audioActive ? 0.5 + Math.min(overlayData.speechRatio, 0.5) : 0.2;
-
-                  const groups: { key: string; icon: typeof Monitor; count: number; title: string; opacity: number }[] = [];
-                  if (monitors.length > 0) groups.push({ key: "monitor", icon: Monitor, count: monitors.length, title: monitors.map((d) => d.name).join(", "), opacity: screenOpacity });
-                  if (inputs.length > 0) groups.push({ key: "mic", icon: Mic, count: inputs.length, title: inputs.map((d) => d.name).join(", "), opacity: audioOpacity });
-                  if (outputs.length > 0) groups.push({ key: "output", icon: Volume2, count: outputs.length, title: outputs.map((d) => d.name).join(", "), opacity: audioOpacity });
-
-                  return groups.map(({ key, icon: Icon, count, title, opacity }) => (
-                    <span key={key} className="flex items-center gap-0.5" title={title}>
-                      <Icon
-                        className="h-3.5 w-3.5 text-foreground transition-opacity duration-500"
-                        style={{ opacity }}
-                      />
-                      {count > 1 && (
-                        <span className="text-[9px] text-foreground/50 font-medium leading-none">{count}</span>
-                      )}
-                    </span>
-                  ));
-                })()}
-                <button
-                  onClick={toggleMeeting}
-                  disabled={meetingLoading}
-                  className="relative flex items-center justify-center h-5 w-5 text-muted-foreground hover:text-foreground transition-colors"
-                  title={manualMeeting ? "stop meeting" : "start meeting"}
-                >
-                  {manualMeeting && (
-                    <span className="absolute -top-0.5 -right-0.5 h-1.5 w-1.5 rounded-full bg-red-500 animate-pulse" />
-                  )}
-                  <Phone className="h-3.5 w-3.5" />
-                </button>
-                <Tooltip>
-                  <TooltipTrigger asChild>
-                    <button
-                      onClick={toggleSidebar}
-                      className="text-muted-foreground hover:text-foreground transition-colors"
-                    >
-                      {sidebarCollapsed ? (
-                        <PanelLeftOpen className="h-4 w-4" />
-                      ) : (
-                        <PanelLeftClose className="h-4 w-4" />
-                      )}
-                    </button>
-                  </TooltipTrigger>
-                  <TooltipContent side="bottom" className="text-xs">
-                    {sidebarCollapsed ? "expand sidebar" : "collapse sidebar"} <kbd className="ml-1 px-1 py-0.5 bg-muted rounded text-[10px]">⌘B</kbd>
-                  </TooltipContent>
-                </Tooltip>
+            <div className={cn("border-b", sidebarCollapsed ? "px-2 py-3" : "px-4 py-3")}>
+              {/* Row 1: name + phone + collapse */}
+              <div className={cn("flex items-center", sidebarCollapsed ? "justify-center" : "justify-between")}>
+                {!sidebarCollapsed && <h1 className="text-lg font-bold text-foreground">screenpipe</h1>}
+                <div className="flex items-center gap-1.5">
+                  <button
+                    onClick={toggleMeeting}
+                    disabled={meetingLoading}
+                    className="relative flex items-center justify-center h-5 w-5 text-muted-foreground hover:text-foreground transition-colors"
+                    title={manualMeeting ? "stop meeting" : "start meeting"}
+                  >
+                    {manualMeeting && (
+                      <span className="absolute -top-0.5 -right-0.5 h-1.5 w-1.5 rounded-full bg-red-500 animate-pulse" />
+                    )}
+                    <Phone className="h-3.5 w-3.5" />
+                  </button>
+                  <Tooltip>
+                    <TooltipTrigger asChild>
+                      <button
+                        onClick={toggleSidebar}
+                        className="text-muted-foreground hover:text-foreground transition-colors"
+                      >
+                        {sidebarCollapsed ? (
+                          <PanelLeftOpen className="h-4 w-4" />
+                        ) : (
+                          <PanelLeftClose className="h-4 w-4" />
+                        )}
+                      </button>
+                    </TooltipTrigger>
+                    <TooltipContent side="bottom" className="text-xs">
+                      {sidebarCollapsed ? "expand sidebar" : "collapse sidebar"} <kbd className="ml-1 px-1 py-0.5 bg-muted rounded text-[10px]">⌘B</kbd>
+                    </TooltipContent>
+                  </Tooltip>
+                </div>
               </div>
+              {/* Row 2: device icons */}
+              {!sidebarCollapsed && (() => {
+                const monitors = recordingDevices.filter((d) => d.kind === "monitor");
+                const inputs = recordingDevices.filter((d) => d.kind === "input");
+                const outputs = recordingDevices.filter((d) => d.kind === "output");
+                const screenOpacity = overlayData.screenActive ? 0.5 + Math.min(overlayData.captureFps / 2, 0.5) : 0.2;
+                const audioOpacity = overlayData.audioActive ? 0.5 + Math.min(overlayData.speechRatio, 0.5) : 0.2;
+
+                const groups: { key: string; icon: typeof Monitor; count: number; title: string; opacity: number }[] = [];
+                if (monitors.length > 0) groups.push({ key: "monitor", icon: Monitor, count: monitors.length, title: monitors.map((d) => d.name).join(", "), opacity: screenOpacity });
+                if (inputs.length > 0) groups.push({ key: "mic", icon: Mic, count: inputs.length, title: inputs.map((d) => d.name).join(", "), opacity: audioOpacity });
+                if (outputs.length > 0) groups.push({ key: "output", icon: Volume2, count: outputs.length, title: outputs.map((d) => d.name).join(", "), opacity: audioOpacity });
+
+                if (groups.length === 0) return null;
+                return (
+                  <div className="flex items-center gap-2 mt-1.5">
+                    {groups.map(({ key, icon: Icon, count, title, opacity }) => (
+                      <span key={key} className="flex items-center gap-0.5" title={title}>
+                        <Icon
+                          className="h-3 w-3 text-foreground transition-opacity duration-500"
+                          style={{ opacity }}
+                        />
+                        {count > 1 && (
+                          <span className="text-[9px] text-foreground/50 font-medium leading-none">{count}</span>
+                        )}
+                      </span>
+                    ))}
+                  </div>
+                );
+              })()}
             </div>
 
             {/* Navigation */}
@@ -442,6 +465,7 @@ function SettingsPageContent() {
                   const btn = (
                     <button
                       key={section.id}
+                      data-testid={`nav-${section.id}`}
                       onClick={() => {
                         setActiveSection(section.id);
                         setSettingsModalOpen(false);
@@ -481,7 +505,7 @@ function SettingsPageContent() {
               <div className="flex-1" />
 
               {/* Team promo card — hidden when user already has a team, sidebar collapsed, or enterprise */}
-              {!teamState.team && !sidebarCollapsed && !isEnterprise && (
+              {!teamState.team && !sidebarCollapsed && !isSectionHidden("team") && (
                 <div className="mx-1 mb-3 p-3 border border-border bg-card">
                   <h3 className="text-sm font-medium text-foreground">
                     Add your team to screenpipe
@@ -500,8 +524,8 @@ function SettingsPageContent() {
 
               {/* Bottom items */}
               <div className="space-y-0.5 border-t border-border pt-2">
-                {/* Team link — hide invite promo in enterprise */}
-                {(!isEnterprise || teamState.team) && (() => {
+                {/* Team link — hide invite promo in enterprise (unless team exists) */}
+                {(!isSectionHidden("team") || teamState.team) && (() => {
                   const teamLabel = teamState.team
                     ? `Your team (${teamState.members.length})`
                     : "Invite your team";
@@ -529,7 +553,7 @@ function SettingsPageContent() {
                 })()}
 
                 {/* Get free month — hidden in enterprise */}
-                {!isEnterprise && (() => {
+                {!isSectionHidden("referral") && (() => {
                   const btn = (
                     <button
                       onClick={() => openModal("referral")}
@@ -557,6 +581,7 @@ function SettingsPageContent() {
                 {(() => {
                   const btn = (
                     <button
+                      data-testid="nav-settings"
                       onClick={() => openModal("general")}
                       className={cn(
                         "w-full flex items-center px-3 py-2 rounded-lg transition-all duration-150 text-left group",
@@ -593,6 +618,7 @@ function SettingsPageContent() {
                   const isActive = activeSection === "help" && !settingsModalOpen;
                   const btn = (
                     <button
+                      data-testid="nav-help"
                       onClick={() => {
                         setActiveSection("help");
                         setSettingsModalOpen(false);

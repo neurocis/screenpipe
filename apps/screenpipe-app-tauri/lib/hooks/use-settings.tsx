@@ -7,7 +7,6 @@ import { platform } from "@tauri-apps/plugin-os";
 import { Store } from "@tauri-apps/plugin-store";
 import React, { createContext, useContext, useEffect, useState } from "react";
 import posthog from "posthog-js";
-import localforage from "localforage";
 import { User } from "../utils/tauri";
 import { SettingsStore } from "../utils/tauri";
 export type VadSensitivity = "low" | "medium" | "high";
@@ -144,8 +143,24 @@ export type Settings = SettingsStore & {
 	pipeSuggestionFrequencyHours?: number;
 	/** User's power mode preference — persisted so it survives app restarts */
 	powerMode?: "auto" | "performance" | "battery_saver";
-	/** Show restart notifications when audio/vision capture stalls (default: true) */
+	/** Show restart notifications when audio/vision capture stalls (default: false for now) */
 	showRestartNotifications?: boolean;
+	/** Offline mode — blocks all external network from pipes, disables PostHog telemetry, keeps Sentry crash reports */
+	offlineMode?: boolean;
+	/** Pause all screen capture when a DRM streaming app (Netflix, Disney+, etc.) is focused */
+	pauseOnDrmContent?: boolean;
+	/** Auto-delete local data older than retention days (free alternative to cloud archive) */
+	localRetentionEnabled?: boolean;
+	/** Days to keep data locally before auto-deleting (default: 30) */
+	localRetentionDays?: number;
+	/** Notification preferences — which notification sources are enabled */
+	notificationPrefs?: {
+		captureStalls: boolean;
+		appUpdates: boolean;
+		pipeSuggestions: boolean;
+		pipeNotifications: boolean;
+		mutedPipes: string[];
+	};
 }
 
 export function getEffectiveFilters(settings: Settings) {
@@ -200,12 +215,12 @@ const DEFAULT_IGNORED_WINDOWS_PER_OS: Record<string, string[]> = {
 	linux: ["Info center", "Discover", "Parted"],
 };
 
-// Default Pi agent preset — local coding agent with screenpipe search skill
+// Default Screenpipe Cloud preset
 const DEFAULT_PI_PRESET: AIPreset = {
 	id: "pi-agent",
 	provider: "pi",
 	url: "",
-	model: "gemini-3.1-pro",
+	model: "qwen/qwen3.5-flash-02-23",
 	maxContextChars: 1000000,
 	defaultPreset: true,
 	prompt: "",
@@ -300,6 +315,8 @@ let DEFAULT_SETTINGS: Settings = {
 			cloudArchiveEnabled: false,
 			cloudArchiveRetentionDays: 7,
 			filterMusic: false,
+			ignoreIncognitoWindows: true,
+			pauseOnDrmContent: false,
 		};
 
 export function createDefaultSettingsObject(): Settings {
@@ -364,6 +381,15 @@ function createSettingsStore() {
 		let needsUpdate = false;
 		if (!settings.deviceId) {
 			settings.deviceId = crypto.randomUUID();
+			needsUpdate = true;
+		}
+
+		// Temporary one-time migration: force restart notifications off for all
+		// existing users until the stall detector is more reliable. Users can
+		// still manually opt back in afterward; the marker prevents re-overriding.
+		if (!(settings as any).restartNotificationsDefaultedOff) {
+			settings.showRestartNotifications = false;
+			(settings as any).restartNotificationsDefaultedOff = true;
 			needsUpdate = true;
 		}
 
@@ -446,16 +472,15 @@ function createSettingsStore() {
 			// platform() unavailable (SSR/tests) — keep existing value
 		}
 
-		// Migration: Default Pro subscribers to cloud transcription (one-time only)
-		if (settings.user?.cloud_subscribed && !(settings as any)._proCloudMigrationDone) {
-			// Switch audio transcription to cloud if still on local default
-			if (
-				settings.audioTranscriptionEngine === "whisper-large-v3-turbo" ||
-				settings.audioTranscriptionEngine === "whisper-large-v3-turbo-quantized"
-			) {
-				settings.audioTranscriptionEngine = "screenpipe-cloud";
-				needsUpdate = true;
-			}
+		// Migration: Move users OFF screenpipe-cloud to local transcription (cost reduction)
+		// Previously Pro subscribers were auto-migrated to cloud; now local is preferred.
+		if (settings.audioTranscriptionEngine === "screenpipe-cloud" || settings.audioTranscriptionEngine === "deepgram") {
+			const p = platform();
+			settings.audioTranscriptionEngine = p === "windows" ? "whisper-tiny-quantized" : "whisper-large-v3-turbo";
+			needsUpdate = true;
+		}
+		// Mark pro migration as done so the old migration doesn't re-trigger
+		if (!(settings as any)._proCloudMigrationDone) {
 			(settings as any)._proCloudMigrationDone = true;
 			needsUpdate = true;
 		}
@@ -467,12 +492,8 @@ function createSettingsStore() {
 				const hw = await tauriCommands.getHardwareCapability();
 				if (hw.isWeakForLargeModel) {
 					const currentEngine = settings.audioTranscriptionEngine;
-					if (settings.user?.cloud_subscribed) {
-						// Pro subscribers: prefer cloud on weak hardware
-						settings.audioTranscriptionEngine = "screenpipe-cloud";
-						needsUpdate = true;
-					} else if (currentEngine.includes("large")) {
-						// Non-pro on weak hardware with a large model: downgrade
+					if (currentEngine.includes("large")) {
+						// Weak hardware with a large model: downgrade to recommended
 						settings.audioTranscriptionEngine = hw.recommendedEngine;
 						needsUpdate = true;
 					}
@@ -540,7 +561,7 @@ interface SettingsContextType {
 	resetSettings: () => Promise<void>;
 	resetSetting: <K extends keyof Settings>(key: K) => Promise<void>;
 	reloadStore: () => Promise<void>;
-	loadUser: (token: string, forceReload?: boolean) => Promise<void>;
+	loadUser: (token: string) => Promise<void>;
 	getDataDir: () => Promise<string>;
 	isSettingsLoaded: boolean;
 	loadingError: string | null;
@@ -583,15 +604,38 @@ export const SettingsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
 	// Auto-refresh user data from API when app starts with a stored token.
 	// This ensures subscription status (cloud_subscribed) stays current —
 	// e.g. when a subscription is granted after the user last logged in.
+	// Retries with exponential backoff so transient network failures don't
+	// leave the user stuck on a stale tier for the entire session.
 	useEffect(() => {
 		if (!isSettingsLoaded) return;
 		const token = settings.user?.token;
 		if (!token) return;
 
-		// Force reload to bypass localforage cache
-		loadUser(token, true).catch((err) => {
-			console.warn("auto-refresh user data failed:", err);
-		});
+		let cancelled = false;
+		const MAX_RETRIES = 3;
+		const BASE_DELAY_MS = 2000; // 2s, 4s, 8s
+
+		const attemptLoad = async () => {
+			for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+				if (cancelled) return;
+				try {
+					await loadUser(token);
+					return; // success
+				} catch (err) {
+					console.warn(
+						`auto-refresh user data failed (attempt ${attempt + 1}/${MAX_RETRIES + 1}):`,
+						err
+					);
+					if (attempt < MAX_RETRIES && !cancelled) {
+						const delay = BASE_DELAY_MS * Math.pow(2, attempt);
+						await new Promise((r) => setTimeout(r, delay));
+					}
+				}
+			}
+		};
+
+		attemptLoad();
+		return () => { cancelled = true; };
 		// eslint-disable-next-line react-hooks/exhaustive-deps
 	}, [isSettingsLoaded]);
 
@@ -626,22 +670,12 @@ export const SettingsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
 
 	// When user becomes a Pro subscriber, default to cloud transcription (one-time)
 	useEffect(() => {
-		if (!settings.user?.cloud_subscribed || !isSettingsLoaded) return;
+		if (!isSettingsLoaded) return;
 		if ((settings as any)._proCloudMigrationDone) return;
 
-		// Switch audio transcription to cloud if still on local default
-		if (
-			settings.audioTranscriptionEngine === "whisper-large-v3-turbo" ||
-			settings.audioTranscriptionEngine === "whisper-large-v3-turbo-quantized"
-		) {
-			settingsStore.set({
-				audioTranscriptionEngine: "screenpipe-cloud",
-				_proCloudMigrationDone: true,
-			} as any);
-		} else {
-			// Mark as done even if we didn't change anything
-			settingsStore.set({ _proCloudMigrationDone: true } as any);
-		}
+		// Mark migration as done — we no longer force cloud transcription for Pro users.
+		// Local engines (whisper/qwen3) are now the default for all users.
+		settingsStore.set({ _proCloudMigrationDone: true } as any);
 		// eslint-disable-next-line react-hooks/exhaustive-deps
 	}, [settings.user?.cloud_subscribed, isSettingsLoaded]);
 
@@ -678,23 +712,8 @@ export const SettingsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
 		return `${homeDirPath}/.screenpipe`;
 	};
 
-	const loadUser = async (token: string, forceReload = false) => {
+	const loadUser = async (token: string) => {
 		try {
-			// try to get from cache first (unless force reload)
-			const cacheKey = `user_data_${token}`;
-			if (!forceReload) {
-				const cached = await localforage.getItem<{
-					data: User;
-					timestamp: number;
-				}>(cacheKey);
-
-				// use cache if less than 30s old
-				if (cached && Date.now() - cached.timestamp < 30000) {
-					await updateSettings({ user: cached.data });
-					return;
-				}
-			}
-
 			const response = await fetch(`https://screenpi.pe/api/user`, {
 				method: "POST",
 				headers: {
@@ -704,7 +723,8 @@ export const SettingsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
 			});
 
 			if (!response.ok) {
-				throw new Error("failed to verify token");
+				const body = await response.text().catch(() => "<no body>");
+				throw new Error(`failed to verify token: ${response.status} ${response.statusText} - ${body}`);
 			}
 
 			const data = await response.json();
@@ -731,15 +751,9 @@ export const SettingsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
 				}
 			}
 
-			// cache the result
-			await localforage.setItem(cacheKey, {
-				data: userData,
-				timestamp: Date.now(),
-			});
-
 			await updateSettings({ user: userData });
 		} catch (err) {
-			console.error("failed to load user:", err);
+			console.error("failed to load user:", err instanceof Error ? err.message : err);
 			throw err;
 		}
 	};

@@ -199,7 +199,7 @@ fn check_package_bin(pkg_dir: std::path::PathBuf, bin_name: &str) -> Option<Stri
     }
 }
 
-const PI_PACKAGE: &str = "@mariozechner/pi-coding-agent@0.57.1";
+const PI_PACKAGE: &str = "@mariozechner/pi-coding-agent@0.60.0";
 const SCREENPIPE_API_URL: &str = "https://api.screenpi.pe/v1";
 
 /// Pool of Pi sessions — each session_id gets its own PiManager/process.
@@ -268,14 +268,19 @@ pub struct PiManager {
     child: Option<Child>,
     stdin: Option<ChildStdin>,
     project_dir: Option<String>,
-    request_id: u64,
     app_handle: AppHandle,
-    /// Tracks last activity (creation or send_command)
     last_activity: std::time::Instant,
     /// Guard: ensures only one `pi_terminated` event is emitted per session.
     terminated_emitted: Arc<AtomicBool>,
     /// Channels waiting for RPC responses, keyed by request ID.
     pending_responses: PendingResponses,
+    /// Command queue handle — all commands go through here for serialization.
+    /// None until the process is started and the queue is spawned.
+    queue_handle: Option<crate::pi_command_queue::PiQueueHandle>,
+    /// Shared state for signaling done/terminated from stdout reader to queue.
+    queue_state: Option<Arc<crate::pi_command_queue::PiQueueState>>,
+    /// Join handle for the queue drain task (for cleanup).
+    queue_task: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl PiManager {
@@ -284,11 +289,13 @@ impl PiManager {
             child: None,
             stdin: None,
             project_dir: None,
-            request_id: 0,
             app_handle,
             last_activity: std::time::Instant::now(),
             terminated_emitted: Arc::new(AtomicBool::new(false)),
             pending_responses: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            queue_handle: None,
+            queue_state: None,
+            queue_task: None,
         }
     }
 
@@ -333,6 +340,16 @@ impl PiManager {
     }
 
     pub fn stop(&mut self) {
+        // Signal queue to stop accepting commands
+        if let Some(state) = self.queue_state.take() {
+            state.signal_terminated();
+        }
+        // Abort the queue drain task
+        if let Some(task) = self.queue_task.take() {
+            task.abort();
+        }
+        self.queue_handle = None;
+
         if let Some(mut child) = self.child.take() {
             // Send abort command before killing
             if let Some(ref mut stdin) = self.stdin {
@@ -355,73 +372,6 @@ impl PiManager {
         self.check_alive()
     }
 
-    /// Send a command to Pi via stdin (fire-and-forget).
-    /// Use this for commands like `prompt` where the result streams via events.
-    pub fn send_command(&mut self, command: Value) -> Result<(), String> {
-        self.send_command_inner(command).map(|_| ())
-    }
-
-    /// Send a command and wait for the Pi process to respond.
-    /// Use this for commands like `abort` and `new_session` that must complete
-    /// before the next command can be sent safely.
-    pub fn send_command_and_wait(
-        &mut self,
-        command: Value,
-        timeout: std::time::Duration,
-    ) -> Result<oneshot::Receiver<RpcResponse>, String> {
-        let req_id = self.send_command_inner(command)?;
-        let (tx, rx) = oneshot::channel();
-        self.pending_responses
-            .lock()
-            .unwrap()
-            .insert(req_id, tx);
-        // Caller awaits `rx` with a timeout
-        let _ = timeout; // timeout is applied by the caller via tokio::time::timeout
-        Ok(rx)
-    }
-
-    /// Shared implementation: stamps the command with an ID, writes to stdin.
-    fn send_command_inner(&mut self, command: Value) -> Result<String, String> {
-        if !self.check_alive() {
-            return Err("Pi process has died".to_string());
-        }
-
-        self.last_activity = std::time::Instant::now();
-        self.request_id += 1;
-        let req_id = format!("req_{}", self.request_id);
-
-        let mut cmd = command;
-        if let Some(obj) = cmd.as_object_mut() {
-            obj.insert("id".to_string(), json!(&req_id));
-        }
-
-        let cmd_str = serde_json::to_string(&cmd).map_err(|e| e.to_string())?;
-        let child_pid = self.child.as_ref().map(|c| c.id());
-        let cmd_type = cmd
-            .get("type")
-            .and_then(|t| t.as_str())
-            .unwrap_or("?")
-            .to_string();
-
-        let stdin = self.stdin.as_mut().ok_or("Pi not running")?;
-
-        info!(
-            "Sending to Pi ({}): type={}, child_pid={:?}, bytes={}",
-            req_id,
-            cmd_type,
-            child_pid,
-            cmd_str.len() + 1
-        );
-
-        writeln!(stdin, "{}", cmd_str)
-            .map_err(|e| format!("Failed to write to Pi stdin: {}", e))?;
-        stdin
-            .flush()
-            .map_err(|e| format!("Failed to flush Pi stdin: {}", e))?;
-        info!("Sent to Pi ({}): flushed ok", req_id);
-
-        Ok(req_id)
-    }
 }
 
 /// Get the Pi config directory (~/.pi/agent)
@@ -508,6 +458,37 @@ fn seed_pi_package_json(install_dir: &std::path::Path) {
         Ok(_) => info!("Seeded pi-agent package.json with lru-cache overrides"),
         Err(e) => warn!("Failed to seed pi-agent package.json: {}", e),
     }
+}
+
+/// Check if the locally-installed pi version matches the expected version.
+fn is_local_pi_version_current(install_dir: &std::path::Path) -> bool {
+    let pkg_json = install_dir
+        .join("node_modules")
+        .join("@mariozechner")
+        .join("pi-coding-agent")
+        .join("package.json");
+    let contents = match std::fs::read_to_string(&pkg_json) {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    let parsed: serde_json::Value = match serde_json::from_str(&contents) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    let installed = match parsed.get("version").and_then(|v| v.as_str()) {
+        Some(v) => v,
+        None => return false,
+    };
+    // PI_PACKAGE is "@mariozechner/pi-coding-agent@0.60.0" — extract version after last '@'
+    let expected = PI_PACKAGE.rsplit('@').next().unwrap_or("");
+    if installed != expected {
+        info!(
+            "local pi version {} differs from expected {}",
+            installed, expected
+        );
+        return false;
+    }
+    true
 }
 
 /// Find the JS entrypoint for the locally-installed pi package.
@@ -616,10 +597,31 @@ fn ensure_web_search_extension(
         .join("extensions");
     let ext_path = ext_dir.join("web-search.ts");
 
-    let is_screenpipe_cloud = match provider_config {
-        Some(config) => matches!(config.provider.as_str(), "screenpipe-cloud" | "pi"),
-        None => true, // default preset = screenpipe cloud
+    // Offline mode: never install web search (it calls api.screenpi.pe)
+    // Re-read from store.bin each time (not cached) so runtime toggles take effect
+    let offline = {
+        let store_path = screenpipe_core::paths::default_screenpipe_data_dir().join("store.bin");
+        std::fs::read_to_string(&store_path)
+            .ok()
+            .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok())
+            .map(|data| {
+                data.get("offlineMode")
+                    .and_then(|v| v.as_bool())
+                    .or_else(|| {
+                        data.get("settings")
+                            .and_then(|s| s.get("offlineMode"))
+                            .and_then(|v| v.as_bool())
+                    })
+                    .unwrap_or(false)
+            })
+            .unwrap_or(false)
     };
+
+    let is_screenpipe_cloud = !offline
+        && match provider_config {
+            Some(config) => matches!(config.provider.as_str(), "screenpipe-cloud" | "pi"),
+            None => true, // default preset = screenpipe cloud
+        };
 
     if is_screenpipe_cloud {
         std::fs::create_dir_all(&ext_dir)
@@ -658,6 +660,9 @@ pub struct PiProviderConfig {
     /// Max output tokens (default 4096)
     #[serde(default = "default_max_tokens")]
     pub max_tokens: i32,
+    /// Optional system prompt from AI preset (appended to Pi's built-in system prompt)
+    #[serde(default)]
+    pub system_prompt: Option<String>,
 }
 
 fn default_max_tokens() -> i32 {
@@ -723,6 +728,8 @@ fn ensure_pi_config(
                 "https://chatgpt.com/backend-api".to_string()
             } else if config.provider == "anthropic" && config.url.is_empty() {
                 "https://api.anthropic.com".to_string()
+            } else if config.provider == "anthropic" && config.url.is_empty() {
+                "https://api.anthropic.com".to_string()
             } else {
                 config.url.clone()
             };
@@ -734,6 +741,7 @@ fn ensure_pi_config(
                 "openai" => "OPENAI_API_KEY".to_string(), // Pi will read from env
                 "openai-chatgpt" => "OPENAI_CHATGPT_TOKEN".to_string(), // OAuth token from env
                 "anthropic" => "ANTHROPIC_API_KEY".to_string(), // Pi will read from env
+                "anthropic" => "ANTHROPIC_API_KEY".to_string(), // OAuth token injected at startup
                 "custom" => "CUSTOM_API_KEY".to_string(), // Pi will read from env
                 _ => "".to_string(),
             };
@@ -906,30 +914,21 @@ fn kill_orphan_pi_processes(managed_alive: bool) {
 /// Keep this short — the process is ready as soon as it starts the readline loop.
 const PI_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
-/// Resolve a model name against the screenpipe cloud models list.
-/// Handles mismatches like "claude-haiku-4-5@20251001" when the list only has
-/// "claude-haiku-4-5" (or vice versa) by stripping date suffixes and finding
-/// the closest match by shared prefix.
+/// Resolve a model name for the screenpipe provider.
+///
+/// The gateway (api.screenpi.pe) is the source of truth for model validation
+/// and supports many more models than the local hardcoded list (OpenRouter,
+/// Gemini, Anthropic, etc.). We only do lightweight normalization here
+/// (strip date suffixes) and pass through to the gateway which will reject
+/// unknown models with a proper error.
 fn resolve_screenpipe_model(requested: &str, provider: &str) -> String {
-    // Only resolve for screenpipe provider — other providers use their own model names
+    // Only touch screenpipe provider — other providers use their own model names
     if provider != "screenpipe" {
         return requested.to_string();
     }
 
-    let models = screenpipe_cloud_models();
-    let model_ids: Vec<&str> = models
-        .as_array()
-        .map(|arr| arr.iter().filter_map(|m| m["id"].as_str()).collect())
-        .unwrap_or_default();
-
-    // Exact match — no resolution needed
-    if model_ids.contains(&requested) {
-        return requested.to_string();
-    }
-
-    // Strip date suffix (@20251001 or -20251001) and try again
+    // Strip date suffix (@20251001 or -20251001) for cleaner model IDs
     let base = requested.split('@').next().unwrap_or(requested);
-    // Also strip trailing -YYYYMMDD pattern
     let base = if base.len() > 9 && base.as_bytes()[base.len() - 9] == b'-' {
         let suffix = &base[base.len() - 8..];
         if suffix.chars().all(|c| c.is_ascii_digit()) {
@@ -941,33 +940,14 @@ fn resolve_screenpipe_model(requested: &str, provider: &str) -> String {
         base
     };
 
-    // Find the best match: exact base match first, then longest shared prefix
-    if let Some(exact) = model_ids.iter().find(|id| {
-        let id_base = id.split('@').next().unwrap_or(id);
-        id_base == base
-    }) {
+    if base != requested {
         info!(
             "resolved model '{}' -> '{}' (stripped date suffix)",
-            requested, exact
+            requested, base
         );
-        return exact.to_string();
     }
 
-    // Fallback: find model whose id starts with the same base
-    if let Some(prefix_match) = model_ids.iter().find(|id| id.starts_with(base)) {
-        info!(
-            "resolved model '{}' -> '{}' (prefix match)",
-            requested, prefix_match
-        );
-        return prefix_match.to_string();
-    }
-
-    // No match found — return as-is and let Pi report the error
-    warn!(
-        "could not resolve model '{}' against available models: {:?}",
-        requested, model_ids
-    );
-    requested.to_string()
+    base.to_string()
 }
 
 /// Maximum number of concurrent Pi sessions before evicting old ones.
@@ -1140,6 +1120,44 @@ pub async fn pi_start_inner(
                             }
                         }
                         info!("Injected bash dir into PATH for pi: {}", bash_dir);
+
+                        // Write shellPath into Pi's settings.json so Pi uses this
+                        // exact bash instead of its own resolution logic (which may
+                        // find a WSL stub or Windows App Alias on machines without
+                        // Git for Windows).
+                        let bash_exe = Path::new(&bash_dir).join("bash.exe");
+                        if bash_exe.exists() {
+                            if let Ok(config_dir) = get_pi_config_dir() {
+                                let settings_path = config_dir.join("settings.json");
+                                let mut settings: serde_json::Value = if settings_path.exists() {
+                                    std::fs::read_to_string(&settings_path)
+                                        .ok()
+                                        .and_then(|c| serde_json::from_str(&c).ok())
+                                        .unwrap_or_else(|| json!({}))
+                                } else {
+                                    json!({})
+                                };
+                                if let Some(obj) = settings.as_object_mut() {
+                                    obj.insert(
+                                        "shellPath".to_string(),
+                                        json!(bash_exe.to_string_lossy()),
+                                    );
+                                }
+                                let _ = std::fs::create_dir_all(&config_dir);
+                                if let Err(e) = std::fs::write(
+                                    &settings_path,
+                                    serde_json::to_string_pretty(&settings).unwrap_or_default(),
+                                ) {
+                                    warn!("failed to write Pi shellPath setting: {}", e);
+                                } else {
+                                    info!(
+                                        "Set Pi shellPath to {} in {:?}",
+                                        bash_exe.display(),
+                                        settings_path
+                                    );
+                                }
+                            }
+                        }
                     }
                     None => {
                         warn!("bash not available — Pi's bash tool may fail on Windows");
@@ -1167,6 +1185,17 @@ pub async fn pi_start_inner(
             "Response is JSON with data[] array containing type (OCR/Audio/UI) and content with text/transcription, timestamp, app_name."
         );
         cmd.args(["--append-system-prompt", api_hint]);
+    }
+
+    // Append the user's AI preset system prompt (enables Anthropic prompt caching —
+    // Pi's built-in system prompt + this text form the cached prefix, reducing
+    // input costs by 90% on subsequent messages in the same conversation)
+    if let Some(ref config) = provider_config {
+        if let Some(ref prompt) = config.system_prompt {
+            if !prompt.is_empty() {
+                cmd.args(["--append-system-prompt", prompt]);
+            }
+        }
     }
 
     // Bun 1.3+ fixed the readline pipe bug (bun 1.2 needed a PTY workaround).
@@ -1252,8 +1281,17 @@ pub async fn pi_start_inner(
     let terminated_emitted = Arc::new(AtomicBool::new(false));
     let pending_responses: PendingResponses;
     if let Some(m) = pool.sessions.get_mut(&sid) {
+        // Spawn the command queue for this session
+        let queue_state = crate::pi_command_queue::PiQueueState::new();
+        let stdin_arc = Arc::new(tokio::sync::Mutex::new(stdin));
+        let (queue_handle, queue_task) =
+            crate::pi_command_queue::spawn_queue(stdin_arc, queue_state.clone(), 0);
+        m.queue_handle = Some(queue_handle);
+        m.queue_state = Some(queue_state);
+        m.queue_task = Some(queue_task);
+
         m.child = Some(child);
-        m.stdin = Some(stdin);
+        m.stdin = None; // stdin is now owned by the queue
         m.project_dir = Some(project_dir.clone());
         m.last_activity = std::time::Instant::now();
         // Fresh flag for this session — old reader threads keep their own Arc
@@ -1262,6 +1300,12 @@ pub async fn pi_start_inner(
     } else {
         pending_responses = Arc::new(std::sync::Mutex::new(HashMap::new()));
     }
+
+    // Grab queue_state for the stdout reader before dropping the lock
+    let queue_state_for_reader = pool
+        .sessions
+        .get(&sid)
+        .and_then(|m| m.queue_state.clone());
 
     // Snapshot the state BEFORE dropping the lock, so we don't hold it during I/O
     let snapshot = match pool.sessions.get_mut(&sid) {
@@ -1313,9 +1357,36 @@ pub async fn pi_start_inner(
                 ready_signalled = true;
             }
 
+            // Signal the command queue when the SDK's agent loop finishes.
+            // "done" = agent turn complete (prompt finished).
+            // "response" = command ACK (new_session/abort acknowledged).
+            // For "response", the SDK's internal agent state machine may still be
+            // transitioning — a small delay prevents the next queued command from
+            // hitting "Agent is already processing".
+            if let Some(ref qs) = queue_state_for_reader {
+                match event_type.as_deref() {
+                    Some("done") => {
+                        qs.signal_done();
+                    }
+                    Some("response") => {
+                        // The SDK ACKed a non-prompt command (new_session/abort)
+                        // but its agent loop may not be fully idle yet. Wait a
+                        // beat before unblocking the queue.
+                        // Note: this runs on a std::thread (not tokio), so use
+                        // std::thread::spawn + std::thread::sleep.
+                        let qs = qs.clone();
+                        std::thread::spawn(move || {
+                            std::thread::sleep(std::time::Duration::from_millis(500));
+                            qs.signal_done();
+                        });
+                    }
+                    _ => {}
+                }
+            }
+
             match parsed {
                 Some(event) => {
-                    // Route RPC responses to waiting callers
+                    // Route RPC responses to waiting callers (legacy path, kept for compat)
                     if event_type.as_deref() == Some("response") {
                         if let Some(id) = event.get("id").and_then(|v| v.as_str()) {
                             let mut pending = pending_for_reader.lock().unwrap();
@@ -1346,6 +1417,10 @@ pub async fn pi_start_inner(
             "Pi stdout reader ended (pid: {}, session: {}), processed {} lines",
             pid, sid_clone, line_count
         );
+        // Signal the command queue that the process is dead
+        if let Some(ref qs) = queue_state_for_reader {
+            qs.signal_terminated();
+        }
         // Only emit once per session — overlapping sessions could race
         if terminated_guard
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -1426,6 +1501,11 @@ pub async fn pi_start_inner(
         }
     }
 
+    // Pi agent bug (pi-mono#2461): first RPC prompt fails with "startsWith" error.
+    // Handled in the frontend — standalone-chat.tsx suppresses startsWith errors.
+    // Do NOT send a warmup prompt here — it burns rate limits on free models
+    // and can crash Pi with 429 errors.
+
     Ok(snapshot)
 }
 
@@ -1439,7 +1519,9 @@ pub struct PiImageContent {
     pub data: String, // base64-encoded image data
 }
 
-/// Send a prompt to Pi, optionally with images
+/// Send a prompt to Pi, optionally with images.
+/// The command is serialized through the queue — it will wait for any prior
+/// command (new_session, abort) to fully complete before being written to stdin.
 #[tauri::command]
 #[specta::specta]
 pub async fn pi_prompt(
@@ -1449,46 +1531,53 @@ pub async fn pi_prompt(
     images: Option<Vec<PiImageContent>>,
 ) -> Result<(), String> {
     let sid = session_id.unwrap_or_else(|| "chat".to_string());
-    let mut pool = state.0.lock().await;
-    let m = pool.sessions.get_mut(&sid).ok_or("Pi not initialized")?;
-
-    if !m.is_running() {
-        return Err("Pi is not running".to_string());
-    }
+    let queue = {
+        let mut pool = state.0.lock().await;
+        let m = pool.sessions.get_mut(&sid).ok_or("Pi not initialized")?;
+        if !m.is_running() {
+            return Err("Pi is not running".to_string());
+        }
+        m.last_activity = std::time::Instant::now();
+        m.queue_handle.clone().ok_or("Pi command queue not initialized")?
+    };
 
     let mut cmd = json!({
         "type": "prompt",
         "message": message
     });
-
     if let Some(imgs) = images {
         if !imgs.is_empty() {
             cmd["images"] = serde_json::to_value(imgs).map_err(|e| e.to_string())?;
         }
     }
 
-    m.send_command(cmd)
+    let rx = queue
+        .send(cmd, crate::pi_command_queue::WaitMode::StreamThenWaitDone)
+        .await?;
+    rx.await.map_err(|_| "Pi command queue dropped".to_string())?
 }
 
-/// Abort current Pi operation. Waits for the Pi SDK to confirm the abort completed.
+/// Abort current Pi operation. Priority command — cancels all pending commands
+/// in the queue and sends abort directly. Waits for the SDK's done event.
 #[tauri::command]
 #[specta::specta]
 pub async fn pi_abort(state: State<'_, PiState>, session_id: Option<String>) -> Result<(), String> {
     let sid = session_id.unwrap_or_else(|| "chat".to_string());
-    let rx = {
+    let queue = {
         let mut pool = state.0.lock().await;
         let m = pool.sessions.get_mut(&sid).ok_or("Pi not initialized")?;
         if !m.is_running() {
             return Err("Pi is not running".to_string());
         }
-        m.send_command_and_wait(json!({"type": "abort"}), RPC_RESPONSE_TIMEOUT)?
+        m.last_activity = std::time::Instant::now();
+        m.queue_handle.clone().ok_or("Pi command queue not initialized")?
     };
-    // Await outside the lock so other commands aren't blocked
-    await_rpc_response(rx, "abort").await
+    queue.abort().await
 }
 
 /// Start a new Pi session (clears conversation history).
-/// Waits for the Pi SDK to finish aborting any in-flight work and resetting state.
+/// Serialized through the queue — waits for any in-flight work to complete,
+/// then sends new_session and waits for the SDK's done event before returning.
 #[tauri::command]
 #[specta::specta]
 pub async fn pi_new_session(
@@ -1496,43 +1585,22 @@ pub async fn pi_new_session(
     session_id: Option<String>,
 ) -> Result<(), String> {
     let sid = session_id.unwrap_or_else(|| "chat".to_string());
-    let rx = {
+    let queue = {
         let mut pool = state.0.lock().await;
         let m = pool.sessions.get_mut(&sid).ok_or("Pi not initialized")?;
         if !m.is_running() {
             return Err("Pi is not running".to_string());
         }
-        m.send_command_and_wait(json!({"type": "new_session"}), RPC_RESPONSE_TIMEOUT)?
+        m.last_activity = std::time::Instant::now();
+        m.queue_handle.clone().ok_or("Pi command queue not initialized")?
     };
-    await_rpc_response(rx, "new_session").await
-}
-
-/// Timeout for RPC responses that must complete before the next command.
-const RPC_RESPONSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
-
-/// Await an RPC response with a timeout. Returns Ok(()) on success or the error from Pi.
-async fn await_rpc_response(
-    rx: oneshot::Receiver<RpcResponse>,
-    command_name: &str,
-) -> Result<(), String> {
-    match tokio::time::timeout(RPC_RESPONSE_TIMEOUT, rx).await {
-        Ok(Ok(resp)) => {
-            if resp.success == Some(true) {
-                Ok(())
-            } else {
-                Err(resp.error.unwrap_or_else(|| format!("{} failed", command_name)))
-            }
-        }
-        Ok(Err(_)) => {
-            // Channel dropped — process likely died
-            Err(format!("Pi process died while waiting for {} response", command_name))
-        }
-        Err(_) => {
-            warn!("Timed out waiting for Pi {} response", command_name);
-            // Don't error — the command was sent, Pi may still process it
-            Ok(())
-        }
-    }
+    let rx = queue
+        .send(
+            json!({"type": "new_session"}),
+            crate::pi_command_queue::WaitMode::WaitDone,
+        )
+        .await?;
+    rx.await.map_err(|_| "Pi command queue dropped".to_string())?
 }
 
 /// Check if pi is available
@@ -1993,27 +2061,44 @@ fn ensure_bash_available() -> Option<String> {
 /// Runs on a dedicated thread, never panics, never blocks the caller.
 /// Sets `PI_INSTALL_DONE` when finished so `pi_start` can wait for it.
 pub fn ensure_pi_installed_background() {
-    // If Pi is already installed locally, check if it needs the lru-cache fix.
+    // If Pi is already installed locally, check if it needs the lru-cache fix
+    // or a version upgrade.
     if find_local_pi_entrypoint().is_some() {
         if let Some(install_dir) = pi_local_install_dir() {
             let pkg_path = install_dir.join("package.json");
-            let needs_fix = pkg_path.exists()
+            let needs_lru_fix = pkg_path.exists()
                 && std::fs::read_to_string(&pkg_path)
                     .map(|c| !c.contains("overrides"))
                     .unwrap_or(false);
-            if needs_fix {
-                info!("Pi installed but missing lru-cache overrides — patching and reinstalling");
+            let needs_upgrade = !is_local_pi_version_current(&install_dir);
+
+            if needs_lru_fix || needs_upgrade {
+                if needs_lru_fix {
+                    info!("Pi installed but missing lru-cache overrides — patching");
+                }
+                if needs_upgrade {
+                    info!("Pi version mismatch — upgrading to {} in background", PI_PACKAGE);
+                }
                 seed_pi_package_json(&install_dir);
-                // Delete bun.lock so bun resolves deps with new overrides
-                let _ = std::fs::remove_file(install_dir.join("bun.lock"));
-                let _ = std::fs::remove_file(install_dir.join("bun.lockb"));
-                // Trigger reinstall in background (don't block)
+                if needs_lru_fix {
+                    // Delete bun.lock so bun resolves deps with new overrides
+                    let _ = std::fs::remove_file(install_dir.join("bun.lock"));
+                    let _ = std::fs::remove_file(install_dir.join("bun.lockb"));
+                }
+                // Run upgrade/reinstall in background but do NOT set PI_INSTALL_DONE
+                // until it completes — otherwise pi_start will launch the stale version
+                // while node_modules is being overwritten, causing import errors.
                 if let Some(bun) = find_bun_executable() {
                     let _ = std::thread::Builder::new()
-                        .name("pi-lru-fix".to_string())
+                        .name("pi-upgrade".to_string())
                         .spawn(move || {
+                            let args = if needs_upgrade {
+                                vec!["add", PI_PACKAGE]
+                            } else {
+                                vec!["install"]
+                            };
                             let mut cmd = std::process::Command::new(&bun);
-                            cmd.current_dir(&install_dir).args(["install"]);
+                            cmd.current_dir(&install_dir).args(&args);
                             #[cfg(windows)]
                             {
                                 use std::os::windows::process::CommandExt;
@@ -2022,21 +2107,26 @@ pub fn ensure_pi_installed_background() {
                             }
                             match cmd.output() {
                                 Ok(output) if output.status.success() => {
-                                    info!("Pi lru-cache fix: reinstall successful");
+                                    info!("Pi upgrade/fix: install successful");
                                 }
                                 Ok(output) => {
                                     let stderr = String::from_utf8_lossy(&output.stderr);
-                                    warn!("Pi lru-cache fix: reinstall failed: {}", stderr);
+                                    warn!("Pi upgrade/fix: install failed: {}", stderr);
                                 }
-                                Err(e) => warn!("Pi lru-cache fix: bun error: {}", e),
+                                Err(e) => warn!("Pi upgrade/fix: bun error: {}", e),
                             }
+                            PI_INSTALL_DONE.store(true, Ordering::SeqCst);
                         });
+                } else {
+                    PI_INSTALL_DONE.store(true, Ordering::SeqCst);
                 }
             } else {
                 debug!("Pi already installed locally, skipping background install");
+                PI_INSTALL_DONE.store(true, Ordering::SeqCst);
             }
+        } else {
+            PI_INSTALL_DONE.store(true, Ordering::SeqCst);
         }
-        PI_INSTALL_DONE.store(true, Ordering::SeqCst);
         return;
     }
 

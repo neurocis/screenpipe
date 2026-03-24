@@ -84,8 +84,12 @@ pub async fn list_pipes(
 }
 
 /// GET /pipes/:id — single pipe detail.
+/// Re-scans disk so pipes installed externally are picked up.
 pub async fn get_pipe(State(pm): State<SharedPipeManager>, Path(id): Path<String>) -> Json<Value> {
     let mgr = pm.lock().await;
+    if let Err(e) = mgr.reload_pipes().await {
+        tracing::warn!("failed to reload pipes from disk: {}", e);
+    }
     match mgr.get_pipe(&id).await {
         Some(pipe) => Json(json!({ "data": pipe })),
         None => Json(json!({ "error": format!("pipe '{}' not found", id) })),
@@ -105,15 +109,60 @@ pub async fn enable_pipe(
     }
 }
 
+/// Optional body for `POST /pipes/:id/run`.
+#[derive(Deserialize, Default)]
+pub struct RunPipeBody {
+    /// Context from a notification action — injected into the pipe prompt.
+    #[serde(default)]
+    pub notification_context: Option<Value>,
+}
+
 /// POST /pipes/:id/run — trigger a manual pipe run.
 /// Uses start_pipe_background to avoid holding the PipeManager mutex for the
 /// entire execution duration, which would block stop/list/other API calls.
+/// Accepts an optional JSON body with `notification_context` to inject into the pipe prompt.
 pub async fn run_pipe_now(
     State(pm): State<SharedPipeManager>,
     Path(id): Path<String>,
+    body: Option<Json<RunPipeBody>>,
 ) -> Json<Value> {
-    let mgr = pm.lock().await;
-    match mgr.start_pipe_background(&id).await {
+    let mut mgr = pm.lock().await;
+
+    // Re-scan disk so newly installed pipes are discovered before lookup
+    if let Err(e) = mgr.reload_pipes().await {
+        tracing::warn!("failed to reload pipes from disk: {}", e);
+    }
+
+    // If notification_context is provided, temporarily set it as extra context
+    let prev_context = if let Some(Json(ref b)) = body {
+        if let Some(ref ctx) = b.notification_context {
+            let formatted = format!(
+                "\n---\nNOTIFICATION ACTION\nThe user clicked a notification button. Respond to this action.\n\nContext:\n{}\n---\n",
+                serde_json::to_string_pretty(ctx).unwrap_or_default()
+            );
+            let prev = mgr.take_extra_context();
+            let combined = match prev.as_ref() {
+                Some(existing) => format!("{}\n{}", existing, formatted),
+                None => formatted,
+            };
+            mgr.set_extra_context(combined);
+            prev
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    let result = mgr.start_pipe_background(&id).await;
+
+    // Restore previous extra context
+    match prev_context {
+        Some(ctx) => mgr.set_extra_context(ctx),
+        None => mgr.clear_extra_context(),
+    }
+
+    match result {
         Ok(()) => Json(json!({ "success": true })),
         Err(e) => Json(json!({ "error": e.to_string() })),
     }

@@ -52,6 +52,7 @@ mod livetext;
 mod livetext_ffi;
 mod permissions;
 mod pi;
+mod pi_command_queue;
 mod pipe_suggestions_scheduler;
 mod recording;
 mod remote_sync_commands;
@@ -97,6 +98,8 @@ use tauri::AppHandle;
 mod dock_menu;
 mod health;
 mod log_files;
+mod native_notification;
+mod native_shortcut_reminder;
 mod safe_icon;
 mod shortcuts;
 mod vault;
@@ -114,6 +117,23 @@ use window::RewindWindowId;
 #[specta::specta]
 fn get_env(name: &str) -> String {
     std::env::var(String::from(name)).unwrap_or(String::from(""))
+}
+
+/// Returns which E2E seeds are requested (env SCREENPIPE_E2E_SEED, comma-separated).
+/// Rust uses "onboarding" in setup to complete onboarding at startup.
+#[tauri::command]
+#[specta::specta]
+fn get_e2e_seed_flags() -> Vec<String> {
+    std::env::var("SCREENPIPE_E2E_SEED")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .map(|s| {
+            s.split(',')
+                .map(|part| part.trim().to_lowercase())
+                .filter(|part| !part.is_empty())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
 }
 
 use tokio::time::{sleep, Duration};
@@ -344,16 +364,27 @@ async fn main() {
         }
     }
 
-    // Check if telemetry is disabled via store setting (analyticsEnabled)
+    // Check if telemetry is disabled via store setting (analyticsEnabled) or offline mode
     let store_path = screenpipe_core::paths::default_screenpipe_data_dir().join("store.bin");
-    let telemetry_disabled = std::fs::read_to_string(&store_path)
+    let store_json = std::fs::read_to_string(&store_path)
         .ok()
-        .and_then(|contents| serde_json::from_str::<serde_json::Value>(&contents).ok())
-        .and_then(|data| data.get("analyticsEnabled").and_then(|v| v.as_bool()))
-        .map(|enabled| !enabled)
-        .unwrap_or(false);
+        .and_then(|contents| serde_json::from_str::<serde_json::Value>(&contents).ok());
+    // Helper: look up a bool key in the store JSON (check both top-level and nested "settings")
+    let store_bool = |key: &str| -> Option<bool> {
+        store_json.as_ref().and_then(|data| {
+            data.get(key)
+                .and_then(|v| v.as_bool())
+                .or_else(|| data.get("settings").and_then(|s| s.get(key)).and_then(|v| v.as_bool()))
+        })
+    };
+    let telemetry_disabled = store_bool("analyticsEnabled").map(|enabled| !enabled).unwrap_or(false);
+    let offline_mode = store_bool("offlineMode").unwrap_or(false);
+    // PostHog is disabled by either telemetry toggle or offline mode
+    // Sentry stays enabled in offline mode (crash reports still sent)
+    let posthog_disabled = telemetry_disabled || offline_mode;
 
     let app_version = env!("CARGO_PKG_VERSION");
+    // Sentry disabled only when telemetry is explicitly off, NOT for offline mode
     let sentry_guard = if !telemetry_disabled {
         Some(sentry::init((
             "https://da4edafe2c8e5e8682505945695ecad7@o4505591122886656.ingest.us.sentry.io/4510761355116544",
@@ -506,6 +537,7 @@ async fn main() {
                 permissions::request_browsers_automation_permission,
                 // Commands from main.rs
                 get_env,
+                get_e2e_seed_flags,
                 vault_status,
                 vault_unlock,
                 get_log_files,
@@ -518,6 +550,7 @@ async fn main() {
                 recording::get_audio_devices,
                 // Commands from commands.rs
                 commands::is_enterprise_build_cmd,
+                commands::get_enterprise_license_key,
                 commands::get_disk_usage,
                 commands::open_pipe_window,
                 commands::update_show_screenpipe_shortcut,
@@ -622,11 +655,26 @@ async fn main() {
             .typ::<hardware::HardwareCapability>()
             .typ::<chatgpt_oauth::ChatGptOAuthStatus>();
 
+        // Export to a temp file first, then only overwrite if content changed.
+        // This avoids triggering the Tauri dev watcher on every launch which
+        // causes an infinite rebuild loop.
+        let bindings_path = "../lib/utils/tauri.ts";
+        let tmp_path = format!("{}.tmp", bindings_path);
         if let Err(e) = builder.export(
             Typescript::default().bigint(specta_typescript::BigIntExportBehavior::BigInt),
-            "../lib/utils/tauri.ts",
+            &tmp_path,
         ) {
             eprintln!("Warning: Failed to export TypeScript bindings: {e}");
+        } else {
+            let new_content = std::fs::read(&tmp_path).unwrap_or_default();
+            let old_content = std::fs::read(bindings_path).unwrap_or_default();
+            if new_content != old_content {
+                if let Err(e) = std::fs::rename(&tmp_path, bindings_path) {
+                    eprintln!("Warning: Failed to move TypeScript bindings: {e}");
+                }
+            } else {
+                let _ = std::fs::remove_file(&tmp_path);
+            }
         }
     }
 
@@ -712,6 +760,9 @@ async fn main() {
     }));
     let app = app.plugin(tauri_plugin_global_shortcut::Builder::new().build());
 
+    #[cfg(feature = "e2e")]
+    let app = app.plugin(tauri_plugin_webdriver::init());
+
     // Only add Sentry plugin if telemetry is enabled
     let app = if let Some(ref _guard) = sentry_guard {
         let client = sentry::Hub::current().client().unwrap();
@@ -729,6 +780,7 @@ async fn main() {
         .manage(pipe_suggestions_state)
         .invoke_handler(tauri::generate_handler![
             commands::is_enterprise_build_cmd,
+            commands::get_enterprise_license_key,
             spawn_screenpipe,
             stop_screenpipe,
             recording::get_monitors,
@@ -792,6 +844,7 @@ async fn main() {
             suspend_global_shortcuts,
             resume_global_shortcuts,
             get_env,
+            get_e2e_seed_flags,
             vault_status,
             vault_unlock,
             // Sync commands
@@ -1008,7 +1061,7 @@ async fn main() {
             info!("Local data directory: {}", base_dir.display());
 
             // PostHog analytics setup
-            let posthog_api_key = "phc_Bt8GoTBPgkCpDrbaIZzJIEYt0CrJjhBiuLaBck1clce".to_string();
+            let posthog_api_key = "phc_z7FZXE8vmXtdTQ78LMy3j1BQWW4zP6PGDUP46rgcdnb".to_string();
             let interval_hours = 6;
 
             // Store setup and initialization - must be done first
@@ -1088,6 +1141,16 @@ async fn main() {
                 store::OnboardingStore::default()
             });
             app.manage(onboarding_store.clone());
+
+            // E2E seed: when SCREENPIPE_E2E_SEED contains "onboarding", mark onboarding complete
+            let e2e_flags = get_e2e_seed_flags();
+            if e2e_flags.iter().any(|f| f == "onboarding") {
+                if let Err(e) = store::OnboardingStore::update(&app.handle(), |o| o.complete()) {
+                    error!("E2E seed: failed to complete onboarding: {}", e);
+                } else {
+                    info!("E2E seed: onboarding marked complete");
+                }
+            }
 
             // Pre-download AI models in background immediately.
             // These downloads don't need any permissions — they just fetch files to cache.
@@ -1405,8 +1468,8 @@ async fn main() {
             }
 
             // Check analytics settings from store
-            let is_analytics_enabled = store
-                .recording.analytics_enabled;
+            // Offline mode disables PostHog analytics but keeps Sentry
+            let is_analytics_enabled = store.recording.analytics_enabled && !offline_mode;
 
             let is_autostart_enabled = store
                 .auto_start_enabled;
@@ -1452,6 +1515,89 @@ async fn main() {
                     error!("Failed to start health check service: {}", e);
                 }
             });
+
+            // Recover webviews after system wake (WKWebView content process dies during sleep)
+            #[cfg(target_os = "macos")]
+            {
+                let app_handle_wake = app_handle.clone();
+                tauri::async_runtime::spawn(async move {
+                    let mut was_asleep = false;
+                    loop {
+                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                        let woke = screenpipe_engine::sleep_monitor::recently_woke_from_sleep();
+                        if woke && !was_asleep {
+                            // System just woke — wait for display to stabilize
+                            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+
+                            // For main/main-window: try JS reload first, destroy+recreate if dead
+                            for label in &["main", "main-window"] {
+                                if let Some(window) = app_handle_wake.get_webview_window(label) {
+                                    // Probe whether the WKWebView JS runtime is still alive
+                                    match window.eval("void(0)") {
+                                        Ok(_) => {
+                                            // JS runtime alive — simple reload suffices
+                                            let _ = window.eval("window.location.reload()");
+                                            tracing::info!("reloaded webview '{}' after wake (JS alive)", label);
+                                        }
+                                        Err(_) => {
+                                            // JS runtime dead — content process was killed.
+                                            // Destroy the window so show() creates a fresh one.
+                                            tracing::warn!(
+                                                "webview '{}' JS runtime dead after wake — destroying for recreation",
+                                                label
+                                            );
+                                            let _ = window.destroy();
+                                        }
+                                    }
+                                }
+                            }
+
+                            // Recreate main window if it was destroyed
+                            if app_handle_wake.get_webview_window("main").is_none()
+                                && app_handle_wake.get_webview_window("main-window").is_none()
+                            {
+                                // Small delay to let destroy() finish cleanup
+                                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                                match ShowRewindWindow::Main.show(&app_handle_wake) {
+                                    Ok(_) => tracing::info!("recreated main window after wake"),
+                                    Err(e) => tracing::error!("failed to recreate main window after wake: {}", e),
+                                }
+                            }
+
+                            // For home/chat: try JS reload (these are simpler windows)
+                            for label in &["home", "chat"] {
+                                if let Some(window) = app_handle_wake.get_webview_window(label) {
+                                    match window.eval("void(0)") {
+                                        Ok(_) => {
+                                            let _ = window.eval("window.location.reload()");
+                                            tracing::info!("reloaded webview '{}' after wake", label);
+                                        }
+                                        Err(_) => {
+                                            tracing::warn!(
+                                                "webview '{}' JS runtime dead after wake — destroying for recreation",
+                                                label
+                                            );
+                                            let _ = window.destroy();
+                                            // Recreate home/chat
+                                            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                                            let variant = match label {
+                                                &"home" => ShowRewindWindow::Home { page: None },
+                                                &"chat" => ShowRewindWindow::Chat,
+                                                _ => continue,
+                                            };
+                                            match variant.show(&app_handle_wake) {
+                                                Ok(_) => tracing::info!("recreated '{}' window after wake", label),
+                                                Err(e) => tracing::error!("failed to recreate '{}' after wake: {}", label, e),
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        was_asleep = woke;
+                    }
+                });
+            }
 
             // Start permission monitor (polls permissions and emits events when lost)
             let app_handle_clone = app_handle.clone();
@@ -1533,6 +1679,13 @@ async fn main() {
             tauri::async_runtime::spawn(async move {
                 tokio::time::sleep(tokio::time::Duration::from_secs(15)).await;
                 sync::auto_start_archive(&app_handle_clone).await;
+            });
+
+            // Auto-start local data retention if it was enabled
+            let app_handle_clone = app_handle.clone();
+            tauri::async_runtime::spawn(async move {
+                tokio::time::sleep(tokio::time::Duration::from_secs(20)).await;
+                sync::auto_start_retention(&app_handle_clone).await;
             });
 
             Ok(())
