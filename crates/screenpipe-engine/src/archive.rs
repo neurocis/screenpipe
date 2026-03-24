@@ -155,53 +155,46 @@ pub async fn archive_init(
     // Use persistent machine ID
     let machine_id = screenpipe_core::sync::get_or_create_machine_id();
 
-    // Reuse the sync manager if sync is already initialized (same encryption keys).
-    // This avoids the AEAD decryption failure that occurs when archive derives a
-    // different password than what sync used to encrypt the master key.
+    // Archive uses its OWN encryption keys, completely independent of cloud sync.
+    // Keys are derived deterministically from the user's token so they're
+    // consistent across restarts without needing server-side key storage.
     let manager = {
-        let sync_guard = state.sync_state.read().await;
-        if let Some(ref sync_rt) = *sync_guard {
-            info!("archive: reusing sync manager (already initialized)");
-            sync_rt.manager.clone()
-        } else {
-            drop(sync_guard);
+        let device_name = hostname::get()
+            .map(|h| h.to_string_lossy().to_string())
+            .unwrap_or_else(|_| "Unknown".to_string());
+        let device_os = std::env::consts::OS.to_string();
 
-            let device_name = hostname::get()
-                .map(|h| h.to_string_lossy().to_string())
-                .unwrap_or_else(|_| "Unknown".to_string());
-            let device_os = std::env::consts::OS.to_string();
+        let config = SyncClientConfig::new(
+            request.token.clone(),
+            machine_id.clone(),
+            device_name,
+            device_os,
+        );
 
-            let config = SyncClientConfig::new(
-                request.token.clone(),
-                machine_id.clone(),
-                device_name,
-                device_os,
-            );
+        let mgr = SyncManager::new(config).map_err(|e| {
+            error!("archive: failed to create sync manager: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": format!("failed to create sync manager: {}", e)})),
+            )
+        })?;
 
-            let mgr = SyncManager::new(config).map_err(|e| {
-                error!("archive: failed to create sync manager: {}", e);
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({"error": format!("failed to create sync manager: {}", e)})),
-                )
-            })?;
+        // Derive encryption keys locally from the token — no server call,
+        // no dependency on sync's key storage.
+        let password = format!(
+            "screenpipe-archive-{:x}",
+            md5::compute(request.token.as_bytes())
+        );
 
-            // Derive encryption password from the token (only used when sync is not active)
-            let password = format!(
-                "screenpipe-archive-{:x}",
-                md5::compute(request.token.as_bytes())
-            );
+        mgr.initialize_local(&password).await.map_err(|e| {
+            error!("archive: failed to derive encryption keys: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": format!("failed to initialize encryption: {}", e)})),
+            )
+        })?;
 
-            mgr.initialize(&password).await.map_err(|e| {
-                error!("archive: failed to initialize encryption: {}", e);
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({"error": format!("failed to initialize encryption: {}", e)})),
-                )
-            })?;
-
-            Arc::new(mgr)
-        }
+        Arc::new(mgr)
     };
 
     let archive_config = ArchiveConfig {
@@ -256,12 +249,26 @@ pub async fn archive_configure(
     Json(request): Json<ArchiveConfigureRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let mut guard = state.archive_state.inner.write().await;
-    let runtime = guard.as_mut().ok_or_else(|| {
-        (
-            StatusCode::BAD_REQUEST,
-            Json(json!({"error": "archive not initialized"})),
-        )
-    })?;
+
+    let runtime = match guard.as_mut() {
+        Some(rt) => rt,
+        None => {
+            // Archive not initialized — if caller wants to disable, that's a no-op
+            let wants_enabled = request.enabled.unwrap_or(false);
+            if !wants_enabled {
+                info!("archive: configure(disable) on uninitialized state — no-op");
+                return Ok(Json(json!({
+                    "success": true,
+                    "enabled": false,
+                    "retention_days": request.retention_days.unwrap_or(7),
+                })));
+            }
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": "archive not initialized, call /archive/init first"})),
+            ));
+        }
+    };
 
     if let Some(days) = request.retention_days {
         runtime.config.retention_days = days;
@@ -904,32 +911,83 @@ async fn count_records_in_range(
 /// Delete data before cutoff and remove orphan media files from disk.
 /// Only deletes video/snapshot files that have been uploaded to cloud
 /// (cloud_blob_id IS NOT NULL).
+///
+/// Batches deletes into 1-hour chunks. Each batch only deletes time-bounded
+/// rows (fast). The expensive orphan cleanup (full-table NOT IN scans) runs
+/// once at the end.
 async fn do_cleanup(db: &Arc<DatabaseManager>, cutoff: DateTime<Utc>) -> anyhow::Result<()> {
-    let epoch = DateTime::<Utc>::MIN_UTC;
-    let result = db.delete_time_range(epoch, cutoff).await?;
+    let batch_size = Duration::hours(1);
 
-    info!(
-        "archive: deleted frames={} ocr={} audio={} accessibility={} ui_events={} \
-         (video_files={} snapshot_files={} audio_files={})",
-        result.frames_deleted,
-        result.ocr_deleted,
-        result.audio_transcriptions_deleted,
-        result.accessibility_deleted,
-        result.ui_events_deleted,
-        result.video_files.len(),
-        result.snapshot_files.len(),
-        result.audio_files.len(),
-    );
+    let oldest = match db.get_oldest_timestamp().await {
+        Ok(Some(ts)) => ts,
+        Ok(None) => return Ok(()),
+        Err(e) => {
+            warn!("archive: failed to get oldest timestamp: {}", e);
+            return Ok(());
+        }
+    };
 
-    // Delete orphan media files from disk (only those confirmed uploaded)
-    for path in result
-        .video_files
-        .iter()
-        .chain(result.audio_files.iter())
-        .chain(result.snapshot_files.iter())
-    {
-        if let Err(e) = tokio::fs::remove_file(path).await {
-            warn!("archive: failed to delete file {}: {}", path, e);
+    let mut batch_start = oldest;
+    let mut any_deleted = false;
+
+    while batch_start < cutoff {
+        let batch_end = (batch_start + batch_size).min(cutoff);
+
+        match db
+            .delete_time_range_batch(batch_start, batch_end, false)
+            .await
+        {
+            Ok(result) => {
+                let batch_total = result.frames_deleted
+                    + result.ocr_deleted
+                    + result.audio_transcriptions_deleted
+                    + result.ui_events_deleted;
+
+                if batch_total > 0 {
+                    any_deleted = true;
+                    info!(
+                        "archive: batch deleted frames={} ocr={} audio={} ui_events={} \
+                         (video_files={} snapshot_files={} audio_files={})",
+                        result.frames_deleted,
+                        result.ocr_deleted,
+                        result.audio_transcriptions_deleted,
+                        result.ui_events_deleted,
+                        result.video_files.len(),
+                        result.snapshot_files.len(),
+                        result.audio_files.len(),
+                    );
+                }
+
+                // Delete media files from disk
+                for path in result
+                    .video_files
+                    .iter()
+                    .chain(result.audio_files.iter())
+                    .chain(result.snapshot_files.iter())
+                {
+                    if let Err(e) = tokio::fs::remove_file(path).await {
+                        warn!("archive: failed to delete file {}: {}", path, e);
+                    }
+                }
+            }
+            Err(e) => {
+                warn!(
+                    "archive: batch delete failed for range {} to {}: {}",
+                    batch_start, batch_end, e
+                );
+            }
+        }
+
+        batch_start = batch_end;
+
+        // Yield between batches so other writes can acquire the semaphore
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+
+    // One-time orphan cleanup after all batches
+    if any_deleted {
+        if let Err(e) = db.cleanup_orphaned_chunks().await {
+            warn!("archive: orphan chunk cleanup failed: {}", e);
         }
     }
 

@@ -1,6 +1,6 @@
 [package]
 name = "screenpipe-app"
-version = "2.2.226"
+version = "2.2.243"
 description = "24/7 memory for your desktop. 100% local."
 authors = ["you"]
 license = ""
@@ -61,7 +61,7 @@ dark-light = "2.0.0"
 tokio = { version = "1.36.0", features = ["full"] }
 
 # HTTP client
-reqwest = { version = "=0.12.12", features = ["blocking", "multipart", "json"] }
+reqwest = { version = "=0.12.12", default-features = false, features = ["blocking", "multipart", "json", "rustls-tls"] }
 
 # tracing
 tracing = "0.1.40"
@@ -121,6 +121,9 @@ screenpipe-events = { path = "../../../crates/screenpipe-events" }
 image = "0.25.5"
 icalendar = "0.17"
 
+# Heap profiling (opt-in via --features heap-prof)
+tikv-jemallocator = { version = "0.6", features = ["profiling"], optional = true }
+
 [target."cfg(not(any(target_os = \"android\", target_os = \"ios\")))".dependencies]
 tauri-plugin-cli = "2.4.1"
 tauri-plugin-global-shortcut = "2.3.1"
@@ -172,7 +175,6 @@ image = "0.25.5"
 futures-channel = "0.3.30"
 lazy_static = "1.5.0"
 
-
 [features]
 default = ["custom-protocol", "qwen3-asr"]
 metal = ["screenpipe-audio/metal"]
@@ -196,6 +198,9 @@ enterprise-build = []
 apple-intelligence = ["screenpipe-engine/apple-intelligence"]
 
 qwen3-asr = ["screenpipe-engine/qwen3-asr"]
+
+# Heap profiling with jemalloc — use for memory debugging only
+heap-prof = ["tikv-jemallocator"]
 
 
 [package.metadata.cargo-machete]

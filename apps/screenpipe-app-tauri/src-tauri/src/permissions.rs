@@ -129,14 +129,8 @@ mod accessibility {
 
     #[link(name = "ApplicationServices", kind = "framework")]
     extern "C" {
-        fn AXIsProcessTrusted() -> bool;
         fn AXIsProcessTrustedWithOptions(options: *const std::ffi::c_void) -> bool;
         static kAXTrustedCheckOptionPrompt: *const std::ffi::c_void;
-    }
-
-    /// Check if the app has accessibility permission (without prompting)
-    pub fn is_trusted() -> bool {
-        unsafe { AXIsProcessTrusted() }
     }
 
     /// Check accessibility permission and show system prompt if not granted
@@ -152,11 +146,7 @@ mod accessibility {
 
 #[cfg(target_os = "macos")]
 fn check_accessibility_permission() -> OSPermissionStatus {
-    if accessibility::is_trusted() {
-        OSPermissionStatus::Granted
-    } else {
-        OSPermissionStatus::Denied
-    }
+    core_to_os_status(screenpipe_core::permissions::check_accessibility())
 }
 
 #[cfg(target_os = "macos")]
@@ -183,6 +173,16 @@ impl OSPermissionStatus {
     }
 }
 
+/// Convert core permission status to the Tauri app's OSPermissionStatus
+fn core_to_os_status(status: screenpipe_core::permissions::PermissionStatus) -> OSPermissionStatus {
+    match status {
+        screenpipe_core::permissions::PermissionStatus::NotNeeded => OSPermissionStatus::NotNeeded,
+        screenpipe_core::permissions::PermissionStatus::NotDetermined => OSPermissionStatus::Empty,
+        screenpipe_core::permissions::PermissionStatus::Granted => OSPermissionStatus::Granted,
+        screenpipe_core::permissions::PermissionStatus::Denied => OSPermissionStatus::Denied,
+    }
+}
+
 #[derive(Serialize, Deserialize, Debug, Type)]
 #[serde(rename_all = "camelCase")]
 pub struct OSPermissionsCheck {
@@ -202,29 +202,7 @@ impl OSPermissionsCheck {
 #[tauri::command(async)]
 #[specta::specta]
 pub fn check_microphone_permission() -> OSPermissionStatus {
-    #[cfg(target_os = "macos")]
-    {
-        use nokhwa_bindings_macos::AVAuthorizationStatus;
-        use nokhwa_bindings_macos::AVMediaType;
-        use objc::*;
-
-        crate::window::with_autorelease_pool(|| {
-            let cls = objc::class!(AVCaptureDevice);
-            let status: AVAuthorizationStatus = unsafe {
-                msg_send![cls, authorizationStatusForMediaType:AVMediaType::Audio.into_ns_str()]
-            };
-            match status {
-                AVAuthorizationStatus::NotDetermined => OSPermissionStatus::Empty,
-                AVAuthorizationStatus::Authorized => OSPermissionStatus::Granted,
-                _ => OSPermissionStatus::Denied,
-            }
-        })
-    }
-
-    #[cfg(not(target_os = "macos"))]
-    {
-        OSPermissionStatus::NotNeeded
-    }
+    core_to_os_status(screenpipe_core::permissions::check_microphone())
 }
 
 /// Check only screen recording permission (no dialog trigger)
@@ -232,20 +210,7 @@ pub fn check_microphone_permission() -> OSPermissionStatus {
 #[tauri::command(async)]
 #[specta::specta]
 pub fn check_screen_recording_permission() -> OSPermissionStatus {
-    #[cfg(target_os = "macos")]
-    {
-        use core_graphics_helmer_fork::access::ScreenCaptureAccess;
-        if ScreenCaptureAccess.preflight() {
-            OSPermissionStatus::Granted
-        } else {
-            OSPermissionStatus::Denied
-        }
-    }
-
-    #[cfg(not(target_os = "macos"))]
-    {
-        OSPermissionStatus::NotNeeded
-    }
+    core_to_os_status(screenpipe_core::permissions::check_screen_recording())
 }
 
 /// Check only accessibility permission
@@ -253,15 +218,7 @@ pub fn check_screen_recording_permission() -> OSPermissionStatus {
 #[tauri::command(async)]
 #[specta::specta]
 pub fn check_accessibility_permission_cmd() -> OSPermissionStatus {
-    #[cfg(target_os = "macos")]
-    {
-        check_accessibility_permission()
-    }
-
-    #[cfg(not(target_os = "macos"))]
-    {
-        OSPermissionStatus::NotNeeded
-    }
+    core_to_os_status(screenpipe_core::permissions::check_accessibility())
 }
 
 /// Reset a permission using tccutil and re-request it
@@ -361,8 +318,9 @@ pub fn do_permissions_check(initial_check: bool) -> OSPermissionsCheck {
                 use objc::*;
 
                 let cls = objc::class!(AVCaptureDevice);
-                let status: AVAuthorizationStatus =
-                    unsafe { msg_send![cls, authorizationStatusForMediaType:media_type.into_ns_str()] };
+                let status: AVAuthorizationStatus = unsafe {
+                    msg_send![cls, authorizationStatusForMediaType:media_type.into_ns_str()]
+                };
                 match status {
                     AVAuthorizationStatus::NotDetermined => OSPermissionStatus::Empty,
                     AVAuthorizationStatus::Authorized => OSPermissionStatus::Granted,
@@ -399,6 +357,7 @@ pub fn do_permissions_check(initial_check: bool) -> OSPermissionsCheck {
 /// Known Chromium-based browsers that use AppleScript for incognito detection
 /// and (in Arc's case) URL capture. Each needs its own Automation permission.
 #[cfg(target_os = "macos")]
+#[allow(dead_code)]
 struct ChromiumBrowserInfo {
     name: &'static str,
     bundle_id: &'static str,

@@ -129,7 +129,7 @@ const INITIAL_DIAGNOSTICS: DiagnosticResults = {
 };
 
 export interface AIProviderCardProps {
-  type: "openai" | "openai-chatgpt" | "native-ollama" | "anthropic" | "custom" | "embedded" | "pi";
+  type: "openai" | "openai-chatgpt" | "native-ollama" | "anthropic" | "custom" | "embedded" | "screenpipe-cloud";
   title: string;
   description: string;
   imageSrc: string;
@@ -158,6 +158,9 @@ export interface AIModel {
   best_for?: string[];
   speed?: string;
   intelligence?: string;
+  cost_tier?: 'free' | 'low' | 'medium' | 'high' | 'very_high';
+  recommended_for?: string[];
+  warning?: string;
 }
 
 export const AIProviderCard = ({
@@ -232,7 +235,7 @@ const AISection = ({
 
   // Filter presets the same way the UI does so hidden presets don't block creation
   const visiblePresets = useMemo(
-    () => settings.aiPresets.filter((p) => !isEnterprise || p.provider !== "pi"),
+    () => settings.aiPresets.filter((p) => !isEnterprise || p.provider !== "screenpipe-cloud"),
     [settings.aiPresets, isEnterprise]
   );
 
@@ -482,7 +485,7 @@ const AISection = ({
         newUrl = "https://api.anthropic.com";
         newModel = "claude-sonnet-4-6";
         break;
-      case "pi":
+      case "screenpipe-cloud":
         newUrl = ""; // Pi uses RPC mode, not HTTP
         newModel = "claude-haiku-4-5";
         break;
@@ -499,7 +502,7 @@ const AISection = ({
   const [isLoadingModels, setIsLoadingModels] = useState(false);
 
   const runDiagnostics = useCallback(async () => {
-    if (settingsPreset?.provider === "pi") return;
+    if (settingsPreset?.provider === "screenpipe-cloud") return;
 
     // Abort any previous run
     diagnosticsAbortRef.current?.abort();
@@ -946,7 +949,7 @@ const AISection = ({
           break;
         }
 
-        case "pi": {
+        case "screenpipe-cloud": {
           // Fetch models from gateway so new models appear automatically
           try {
             const token = settings.user?.token || "";
@@ -1024,7 +1027,7 @@ const AISection = ({
 
   // Auto-trigger diagnostics when provider + url + apiKey are set (debounced)
   useEffect(() => {
-    if (settingsPreset?.provider === "pi") return;
+    if (settingsPreset?.provider === "screenpipe-cloud") return;
     if (!settingsPreset?.provider) return;
 
     const needsApiKey =
@@ -1110,12 +1113,12 @@ const AISection = ({
 
           {piAvailable && (
             <AIProviderCard
-              type="pi"
+              type="screenpipe-cloud"
               title="Screenpipe Cloud"
               description="AI coding agent powered by Screenpipe Cloud. Requires login."
               imageSrc="/images/screenpipe.png"
-              selected={settingsPreset?.provider === "pi"}
-              onClick={() => handleAiProviderChange("pi")}
+              selected={settingsPreset?.provider === "screenpipe-cloud"}
+              onClick={() => handleAiProviderChange("screenpipe-cloud")}
               disabled={!settings.user?.token}
               warningText={!settings.user?.token ? "Login required" : undefined}
             />
@@ -1132,6 +1135,8 @@ const AISection = ({
         validation={(value) => validatePresetName(value, visiblePresets, preset?.id)}
         placeholder="Enter preset name"
         required={true}
+        spellCheck={false}
+        autoCorrect="off"
         disabled={!!preset && !isDuplicating && preset.id !== undefined}
         helperText="Only letters, numbers, spaces, hyphens, and underscores allowed"
       />
@@ -1326,7 +1331,9 @@ const AISection = ({
                         </CommandGroup>
                       )}
                       <CommandGroup heading={models?.some((m) => m.free) ? "Included with Screenpipe" : "Available Models"}>
-                        {models?.filter((m) => !m.free).map((model) => (
+                        {models?.filter((m) => !m.free).map((model) => {
+                          const costLabel = model.cost_tier === 'low' ? '$' : model.cost_tier === 'medium' ? '$$' : model.cost_tier === 'high' ? '$$$' : model.cost_tier === 'very_high' ? '$$$$' : '';
+                          return (
                           <CommandItem
                             key={model.id}
                             value={model.id}
@@ -1356,17 +1363,24 @@ const AISection = ({
                               <div className="flex items-center justify-between">
                                 <span className="font-medium">{model.name}</span>
                                 <div className="flex items-center gap-1 ml-2">
-                                  {model.intelligence === "highest" && <Badge variant="outline" className="text-[10px]">smartest</Badge>}
-                                  {model.speed === "fast" && model.intelligence !== "highest" && <Badge variant="outline" className="text-[10px]">fast</Badge>}
-                                  {model.tags?.includes("reasoning") && model.intelligence !== "highest" && <Badge variant="outline" className="text-[10px]">reasoning</Badge>}
+                                  {costLabel && <Badge variant="outline" className="text-[10px]">{costLabel}</Badge>}
+                                  {model.speed === "fast" && <Badge variant="outline" className="text-[10px]">fast</Badge>}
                                 </div>
                               </div>
-                              {model.description && (
-                                <span className="text-xs text-muted-foreground">{model.description}{model.context_window ? ` · ${Math.round(model.context_window / 1000)}K ctx` : ""}</span>
+                              <span className="text-xs text-muted-foreground">
+                                {model.description}{model.context_window ? ` · ${Math.round(model.context_window / 1000)}K ctx` : ""}
+                              </span>
+                              {model.recommended_for && model.recommended_for.length > 0 && (
+                                <div className="flex items-center gap-1 mt-0.5">
+                                  {model.recommended_for.map((use) => (
+                                    <span key={use} className="text-[9px] rounded bg-muted px-1 py-0.5 text-muted-foreground">{use}</span>
+                                  ))}
+                                </div>
                               )}
                             </div>
                           </CommandItem>
-                        ))}
+                          );
+                        })}
                       </CommandGroup>
                     </>
                   )}
@@ -1374,6 +1388,35 @@ const AISection = ({
               </Command>
             </PopoverContent>
           </Popover>
+          {(() => {
+            const selectedModel = models?.find((m) => m.id === settingsPreset?.model);
+            if (selectedModel?.warning) {
+              return (
+                <div className="flex items-start gap-2 rounded-md border p-3 text-xs text-muted-foreground">
+                  <span className="shrink-0 text-sm">!</span>
+                  <div className="space-y-1">
+                    <p>{selectedModel.warning}</p>
+                    {models?.filter((m) => m.recommended_for?.includes('pipes') && m.id !== selectedModel.id).slice(0, 2).length > 0 && (
+                      <p className="text-muted-foreground">
+                        recommended for pipes:{" "}
+                        {models.filter((m) => m.recommended_for?.includes('pipes') && m.id !== selectedModel.id).slice(0, 3).map((m) => (
+                          <button
+                            key={m.id}
+                            type="button"
+                            className="inline-flex items-center rounded bg-muted px-1.5 py-0.5 mr-1 font-medium hover:bg-accent cursor-pointer"
+                            onClick={() => updateSettingsPreset({ model: m.id })}
+                          >
+                            {m.name} {m.free ? "(free)" : ""}
+                          </button>
+                        ))}
+                      </p>
+                    )}
+                  </div>
+                </div>
+              );
+            }
+            return null;
+          })()}
           {settingsPreset?.provider === "native-ollama" && (
             <div className="text-xs text-muted-foreground space-y-1">
               <p>
@@ -1411,7 +1454,7 @@ const AISection = ({
         helperText="This prompt will be used to guide the AI's responses"
       />
 
-      {settingsPreset?.provider !== "pi" && (
+      {settingsPreset?.provider !== "screenpipe-cloud" && (
         <div className="w-full">
           <Label htmlFor="maxTokens" className="text-sm font-medium">
             Max Output Tokens
@@ -1456,7 +1499,7 @@ const AISection = ({
         </div>
       )}
 
-      {settingsPreset?.provider !== "pi" && (
+      {settingsPreset?.provider !== "screenpipe-cloud" && (
         <div className="w-full border rounded-lg">
           <button
             type="button"
@@ -1780,7 +1823,7 @@ export const AIPresets = () => {
     try {
       // Prevent deletion of pi-agent preset for Pro subscribers (pi = screenpipe cloud)
       const presetToRemove = settings.aiPresets.find((preset) => preset.id === id);
-      if (presetToRemove?.provider === "pi" && settings.user?.cloud_subscribed) {
+      if (presetToRemove?.provider === "screenpipe-cloud" && settings.user?.cloud_subscribed) {
         toast({
           title: "Cannot delete cloud preset",
           description: "This preset is included with your Pro subscription",
@@ -1955,11 +1998,11 @@ export const AIPresets = () => {
 
       <DndContext sensors={sensors} collisionDetection={closestCenter} onDragEnd={handleDragEnd}>
         <SortableContext
-          items={settings.aiPresets.filter((preset) => !isEnterprise || preset.provider !== "pi").map((p) => p.id)}
+          items={settings.aiPresets.filter((preset) => !isEnterprise || preset.provider !== "screenpipe-cloud").map((p) => p.id)}
           strategy={rectSortingStrategy}
         >
           <div className="w-full grid grid-cols-1 md:grid-cols-2 gap-3">
-            {settings.aiPresets.filter((preset) => !isEnterprise || preset.provider !== "pi").map((preset) => (
+            {settings.aiPresets.filter((preset) => !isEnterprise || preset.provider !== "screenpipe-cloud").map((preset) => (
               <SortablePresetCard
                 key={preset.id}
                 preset={preset}

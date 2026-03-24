@@ -192,11 +192,11 @@ export function AIProviderConfig({
   const [showApiKey, setShowApiKey] = useState(false);
   const isEnterprise = useIsEnterpriseBuild();
   const [piAvailable, setPiAvailable] = useState(false);
-  const [piModels, setPiModels] = useState<{ id: string; name: string; free?: boolean; health?: { status: string; error_rate_5m: number } }[]>([]);
+  const [piModels, setPiModels] = useState<{ id: string; name: string; free?: boolean; cost_tier?: string; recommended_for?: string[]; warning?: string; health?: { status: string; error_rate_5m: number } }[]>([]);
 
   // Fetch PI models from gateway (single source of truth)
   useEffect(() => {
-    if (selectedProvider !== "pi") return;
+    if (selectedProvider !== "screenpipe-cloud") return;
     const fetchPiModels = async () => {
       try {
         const token = settings?.user?.token || "";
@@ -209,6 +209,9 @@ export function AIProviderConfig({
             id: m.id,
             name: m.name || m.id,
             free: m.free,
+            cost_tier: m.cost_tier,
+            recommended_for: m.recommended_for,
+            warning: m.warning,
             health: m.health,
           }));
           setPiModels(models);
@@ -430,6 +433,7 @@ export function AIProviderConfig({
             autoComplete="off"
             autoCorrect="off"
             autoCapitalize="off"
+            spellCheck={false}
             disabled={
               Boolean(defaultPreset?.id) &&
               settings.aiPresets.some((p) => p.id === defaultPreset?.id)
@@ -533,13 +537,13 @@ export function AIProviderConfig({
             <Button
               type="button"
               disabled={!settings?.user?.token}
-              variant={selectedProvider === "pi" ? "default" : "outline"}
+              variant={selectedProvider === "screenpipe-cloud" ? "default" : "outline"}
               className="flex h-8 items-center justify-center gap-1.5 text-xs px-3"
               onClick={() => {
-                setSelectedProvider("pi");
+                setSelectedProvider("screenpipe-cloud");
                 setFormData({
                   ...formData,
-                  provider: "pi",
+                  provider: "screenpipe-cloud",
                   url: "", // Pi uses RPC mode
                   model: "claude-haiku-4-5",
                 });
@@ -808,7 +812,7 @@ export function AIProviderConfig({
           </div>
         )}
 
-        {selectedProvider === "pi" && (
+        {selectedProvider === "screenpipe-cloud" && (
           <div className="space-y-1">
             <Label htmlFor="model" className="text-xs">model</Label>
             <Select
@@ -821,18 +825,34 @@ export function AIProviderConfig({
                 <SelectValue placeholder="select model" />
               </SelectTrigger>
               <SelectContent>
-                {piModels.map((m) => (
+                {piModels.map((m) => {
+                  const costLabel = m.cost_tier === 'low' ? '$' : m.cost_tier === 'medium' ? '$$' : m.cost_tier === 'high' ? '$$$' : m.cost_tier === 'very_high' ? '$$$$' : '';
+                  return (
                   <SelectItem key={m.id} value={m.id}>
                     <span className="flex items-center gap-1.5">
                       {m.health?.status === 'down' && <span className="inline-block w-1.5 h-1.5 rounded-full bg-red-500" title="overloaded" />}
                       {m.health?.status === 'degraded' && <span className="inline-block w-1.5 h-1.5 rounded-full bg-yellow-500" title="degraded" />}
                       {m.name}{m.free ? " (free)" : ""}
+                      {costLabel && <span className="text-[9px] font-medium text-muted-foreground">{costLabel}</span>}
+                      {m.recommended_for?.includes('pipes') && <span className="text-[9px] text-muted-foreground bg-muted rounded px-1">pipes</span>}
                       {m.health?.status === 'down' && <span className="text-[9px] text-red-400 ml-1">overloaded</span>}
                     </span>
                   </SelectItem>
-                ))}
+                  );
+                })}
               </SelectContent>
             </Select>
+            {(() => {
+              const selectedModel = piModels.find((m) => m.id === formData.model);
+              if (selectedModel?.warning) {
+                return (
+                  <p className="text-[10px] text-muted-foreground mt-1">
+                    ! {selectedModel.warning}
+                  </p>
+                );
+              }
+              return null;
+            })()}
           </div>
         )}
 
@@ -1015,7 +1035,7 @@ export const AIPresetsSelector = ({
   // eslint-disable-next-line react-hooks/exhaustive-deps
   const aiPresets = useMemo(() => {
     const presets = (settings?.aiPresets || []) as AIPreset[];
-    return isEnterprise ? presets.filter((p) => p.provider !== "pi") : presets;
+    return isEnterprise ? presets.filter((p) => p.provider !== "screenpipe-cloud") : presets;
   }, [settings?.aiPresets, isEnterprise]);
 
   const selectedPreset = useMemo(() => {
@@ -1030,7 +1050,7 @@ export const AIPresetsSelector = ({
   // Check if selected preset requires login
   const selectedPresetRequiresLogin = useMemo(() => {
     const preset = aiPresets.find((p) => p.id === selectedPreset);
-    return preset?.provider === "pi" && !settings?.user?.token;
+    return preset?.provider === "screenpipe-cloud" && !settings?.user?.token;
   }, [aiPresets, selectedPreset, settings?.user?.token]);
 
   useEffect(() => {
@@ -1248,7 +1268,7 @@ export const AIPresetsSelector = ({
   const handleRemovePreset = (preset: AIPreset) => {
     if (!settings?.aiPresets) return;
     // Prevent deletion of pi-agent preset for Pro subscribers (pi = screenpipe cloud)
-    if (preset.provider === "pi" && settings.user?.cloud_subscribed) {
+    if (preset.provider === "screenpipe-cloud" && settings.user?.cloud_subscribed) {
       toast.error("Cannot delete cloud preset", {
         description: "This preset is included with your Pro subscription",
       });

@@ -522,7 +522,7 @@ fn resolve_preset(pipes_dir: &Path, preset_id: &str) -> Option<ResolvedPreset> {
                 "aiPresets": [{
                     "id": "default",
                     "model": "claude-haiku-4-5",
-                    "provider": "pi",
+                    "provider": "screenpipe-cloud",
                     "defaultPreset": true,
                     "maxContextChars": 200000
                 }]
@@ -558,7 +558,7 @@ fn resolve_preset(pipes_dir: &Path, preset_id: &str) -> Option<ResolvedPreset> {
         .get("provider")
         .and_then(|v| v.as_str())
         .and_then(|p| match p {
-            "pi" => Some("screenpipe"),
+            "screenpipe-cloud" | "pi" => Some("screenpipe"),
             "native-ollama" => Some("ollama"),
             "openai" => Some("openai"),
             "openai-chatgpt" => Some("openai-chatgpt"),
@@ -1313,13 +1313,23 @@ impl PipeManager {
                     ),
                 }
             } else {
-                (
-                    config.model.clone(),
-                    config.provider.clone(),
-                    None,
-                    None,
-                    None,
-                )
+                // No preset — use user's default preset
+                match resolve_preset(&self.pipes_dir, "default") {
+                    Some(resolved) => (
+                        resolved.model,
+                        resolved.provider,
+                        resolved.url,
+                        resolved.api_key,
+                        resolved.prompt,
+                    ),
+                    None => (
+                        config.model.clone(),
+                        config.provider.clone(),
+                        None,
+                        None,
+                        None,
+                    ),
+                }
             };
 
         // Create DB execution row
@@ -1351,6 +1361,8 @@ impl PipeManager {
 
         let pipe_dir = self.pipes_dir.clone().join(name);
 
+        let pipe_system_prompt =
+            render_pipe_system_prompt(&body, self.api_port, preset_prompt.as_deref());
         let prompt = self.render_prompt(&config, &body, preset_prompt.as_deref());
         let pipe_name = name.to_string();
 
@@ -1445,7 +1457,7 @@ impl PipeManager {
                     Some(pid_tx),
                     line_tx,
                     history_enabled,
-                    None, // manual run — gateway-side caching still applies
+                    Some(&pipe_system_prompt),
                 ),
             )
             .await;
@@ -1727,14 +1739,36 @@ impl PipeManager {
                     }
                 }
             } else {
-                (
-                    config.model.clone(),
-                    config.provider.clone(),
-                    None,
-                    None,
-                    None,
-                    None,
-                )
+                // No preset in pipe config — use the user's default preset
+                // so pipes respect the user's AI settings instead of silently
+                // falling through to screenpipe cloud.
+                match resolve_preset(&self.pipes_dir, "default") {
+                    Some(resolved) => {
+                        info!(
+                            "pipe '{}': no preset configured, using user's default preset → model={}, provider={:?}",
+                            name, resolved.model, resolved.provider
+                        );
+                        (
+                            resolved.model,
+                            resolved.provider,
+                            resolved.url,
+                            resolved.api_key,
+                            resolved.prompt,
+                            None,
+                        )
+                    }
+                    None => {
+                        // No default preset found — fall back to pipe's own config
+                        (
+                            config.model.clone(),
+                            config.provider.clone(),
+                            None,
+                            None,
+                            None,
+                            None,
+                        )
+                    }
+                }
             };
 
             // Create DB execution row
@@ -1766,6 +1800,8 @@ impl PipeManager {
                 .unwrap_or(false);
 
             // Build prompt with context header
+            let pipe_system_prompt =
+                render_pipe_system_prompt(&body, self.api_port, preset_prompt.as_deref());
             let prompt = self.render_prompt(&config, &body, preset_prompt.as_deref());
 
             // Create a channel so the executor can report PID immediately
@@ -1851,7 +1887,7 @@ impl PipeManager {
                     Some(pid_tx),
                     line_tx,
                     history_enabled,
-                    None, // manual run — gateway-side caching still applies
+                    Some(&pipe_system_prompt),
                 ),
             )
             .await;
@@ -1901,12 +1937,13 @@ impl PipeManager {
                         let _ = store.upsert_scheduler_state(name, output.success).await;
                     }
 
-                    // Update circuit breaker state
+                    // Update circuit breaker state — always record failures
+                    // even with a single preset, so the breaker is pre-tripped
+                    // when the user adds a fallback preset later.
                     if let Some(ref pid) = active_preset_id {
                         if output.success {
                             self.fallback_registry.record_success(pid);
-                        } else if config.preset.len() > 1 {
-                            // Only record failure for fallback if multiple presets configured
+                        } else {
                             self.fallback_registry.record_failure_from_output(
                                 pid,
                                 &output.stderr,
@@ -3112,6 +3149,31 @@ pub fn parse_frontmatter(content: &str) -> Result<(PipeConfig, String)> {
 pub fn serialize_pipe(config: &PipeConfig, body: &str) -> Result<String> {
     let mut cfg = config.clone();
     cfg.name = String::new(); // empty → skip_serializing_if kicks in
+
+    // Remove legacy "config" key from extras — old pipe.md files had a nested
+    // `config: { enabled: true }` block that gets captured by the flattened
+    // HashMap and re-emitted forever. Also strip any keys that shadow real
+    // struct fields to prevent duplicates.
+    const KNOWN_FIELDS: &[&str] = &[
+        "config",
+        "name",
+        "schedule",
+        "enabled",
+        "agent",
+        "model",
+        "provider",
+        "preset",
+        "connections",
+        "permissions",
+        "timeout",
+        "source_slug",
+        "installed_version",
+        "source_hash",
+    ];
+    for key in KNOWN_FIELDS {
+        cfg.config.remove(*key);
+    }
+
     let yaml = serde_yaml::to_string(&cfg)?;
     Ok(format!("---\n{}---\n\n{}\n", yaml, body))
 }
@@ -3660,6 +3722,52 @@ mod tests {
         assert!(parsed.name.is_empty());
     }
 
+    #[test]
+    fn test_serialize_strips_legacy_config_block() {
+        // Old pipe.md files had `config: { enabled: true }` which gets caught
+        // by the flattened HashMap. Verify serialize_pipe strips it.
+        let content = "---\nschedule: every 30m\nenabled: true\nconfig:\n  enabled: true\n---\n\nHello prompt";
+        let (config, body) = parse_frontmatter(content).unwrap();
+
+        // Confirm the legacy key was captured in the extras HashMap
+        assert!(
+            config.config.contains_key("config"),
+            "expected 'config' key in extras HashMap after parsing legacy frontmatter"
+        );
+
+        // Serialize and re-parse — the nested config block should be gone
+        let serialized = serialize_pipe(&config, &body).unwrap();
+        assert!(
+            !serialized.contains("config:"),
+            "serialized output should not contain legacy 'config:' block, got:\n{}",
+            serialized
+        );
+
+        let (reparsed, reparsed_body) = parse_frontmatter(&serialized).unwrap();
+        assert!(
+            reparsed.config.is_empty(),
+            "extras HashMap should be empty after roundtrip"
+        );
+        assert_eq!(reparsed.enabled, true);
+        assert_eq!(reparsed.schedule, "every 30m");
+        assert_eq!(reparsed_body, "Hello prompt");
+    }
+
+    #[test]
+    fn test_serialize_preserves_unknown_extra_fields() {
+        // Extra fields that are NOT known struct fields should survive roundtrip
+        let content = "---\nschedule: every 1h\nenabled: true\nhistory: true\n---\n\nBody";
+        let (config, body) = parse_frontmatter(content).unwrap();
+        assert!(config.config.contains_key("history"));
+
+        let serialized = serialize_pipe(&config, &body).unwrap();
+        assert!(
+            serialized.contains("history: true"),
+            "unknown extra field 'history' should be preserved, got:\n{}",
+            serialized
+        );
+    }
+
     // -- schedule parsing ---------------------------------------------------
 
     #[test]
@@ -3724,6 +3832,8 @@ mod tests {
 
     #[test]
     fn test_render_prompt_uses_port() {
+        // render_prompt_with_port is the *user* prompt (time context only).
+        // Port / body / system_prompt are handled by render_pipe_system_prompt.
         let config = PipeConfig {
             name: "test".to_string(),
             schedule: "every 1h".to_string(),
@@ -3741,9 +3851,14 @@ mod tests {
             source_hash: None,
         };
         let prompt = render_prompt_with_port(&config, "body text", 3031, None, None);
-        assert!(prompt.contains("http://localhost:3031"));
-        assert!(!prompt.contains("http://localhost:3030"));
-        assert!(prompt.contains("body text"));
+        // User prompt contains time range and the "Execute" instruction
+        assert!(prompt.contains("Time range:"));
+        assert!(prompt.contains("Execute the pipe now."));
+        // Port / body go into system prompt, not user prompt
+        let sys = render_pipe_system_prompt("body text", 3031, None);
+        assert!(sys.contains("http://localhost:3031"));
+        assert!(!sys.contains("http://localhost:3030"));
+        assert!(sys.contains("body text"));
     }
 
     #[test]
@@ -3764,8 +3879,8 @@ mod tests {
             installed_version: None,
             source_hash: None,
         };
-        let prompt = render_prompt_with_port(&config, "hello", 3030, None, None);
-        assert!(prompt.contains("http://localhost:3030"));
+        let sys = render_pipe_system_prompt("hello", 3030, None);
+        assert!(sys.contains("http://localhost:3030"));
     }
 
     #[test]
@@ -3786,16 +3901,10 @@ mod tests {
             installed_version: None,
             source_hash: None,
         };
-        let prompt = render_prompt_with_port(
-            &config,
-            "body text",
-            3030,
-            Some("You are a helpful assistant"),
-            None,
-        );
-        assert!(prompt.starts_with("System prompt:\nYou are a helpful assistant\n\n"));
-        assert!(prompt.contains("body text"));
-        assert!(prompt.contains("http://localhost:3030"));
+        let sys = render_pipe_system_prompt("body text", 3030, Some("You are a helpful assistant"));
+        assert!(sys.starts_with("You are a helpful assistant\n\n"));
+        assert!(sys.contains("body text"));
+        assert!(sys.contains("http://localhost:3030"));
     }
 
     #[test]
@@ -3816,9 +3925,9 @@ mod tests {
             installed_version: None,
             source_hash: None,
         };
-        let prompt = render_prompt_with_port(&config, "body text", 3030, None, None);
-        assert!(!prompt.contains("System prompt:"));
-        assert!(prompt.contains("body text"));
+        let sys = render_pipe_system_prompt("body text", 3030, None);
+        assert!(!sys.contains("System prompt:"));
+        assert!(sys.contains("body text"));
     }
 
     // -- PipeExecution / SchedulerState serde roundtrip ----------------------

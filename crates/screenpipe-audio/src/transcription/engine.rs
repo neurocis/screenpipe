@@ -46,6 +46,8 @@ pub enum TranscriptionEngine {
         client: Arc<Client>,
         languages: Vec<Language>,
         vocabulary: Vec<VocabularyEntry>,
+        headers: Option<std::collections::HashMap<String, String>>,
+        raw_audio: bool,
     },
     Disabled,
 }
@@ -81,6 +83,8 @@ impl TranscriptionEngine {
                     client,
                     languages,
                     vocabulary,
+                    headers: oc_config.headers,
+                    raw_audio: oc_config.raw_audio,
                 })
             }
 
@@ -134,7 +138,13 @@ impl TranscriptionEngine {
                 .map_err(|e| anyhow!("failed to load whisper model: {}", e))?;
 
                 info!("whisper model loaded successfully");
-                whisper_rs::install_logging_hooks();
+                // NOTE: do NOT call whisper_rs::install_logging_hooks() here.
+                // It redirects ggml/whisper logs into Rust's tracing subscriber via
+                // a global FFI callback. During app restart (process::exit), C++ static
+                // destructors free Metal GPU resources and try to log via this hook —
+                // but the tracing subscriber's thread-local storage is already torn down,
+                // causing a double panic → abort. Without the hook, ggml logs go to
+                // stderr harmlessly.
 
                 Ok(Self::Whisper {
                     context,
@@ -189,6 +199,8 @@ impl TranscriptionEngine {
                 client,
                 languages,
                 vocabulary,
+                headers,
+                raw_audio,
             } => Ok(TranscriptionSession::OpenAICompatible {
                 endpoint: endpoint.clone(),
                 api_key: api_key.clone(),
@@ -196,6 +208,8 @@ impl TranscriptionEngine {
                 client: client.clone(),
                 languages: languages.clone(),
                 vocabulary: vocabulary.clone(),
+                headers: headers.clone(),
+                raw_audio: *raw_audio,
             }),
             Self::Disabled => Ok(TranscriptionSession::Disabled),
         }
@@ -250,6 +264,8 @@ pub enum TranscriptionSession {
         client: Arc<Client>,
         languages: Vec<Language>,
         vocabulary: Vec<VocabularyEntry>,
+        headers: Option<std::collections::HashMap<String, String>>,
+        raw_audio: bool,
     },
     Disabled,
 }
@@ -270,20 +286,36 @@ impl TranscriptionSession {
                 languages,
                 vocabulary,
             } => {
-                match transcribe_with_deepgram(
-                    api_key,
-                    audio,
-                    device,
-                    sample_rate,
-                    languages.clone(),
-                    vocabulary,
-                )
-                .await
-                {
-                    Ok(t) => Ok(t),
-                    Err(e) => {
-                        error!("device: {}, deepgram transcription failed: {:?}", device, e);
-                        Err(e)
+                // Deepgram is a paid API — skip near-silence to avoid burning costs.
+                // Empirical RMS values (see audio_manager/manager.rs):
+                //   output silence = 0.0, output playing = 0.0028, input speech ≈ 0.05+
+                // Audio here is post-normalization (target RMS 0.2), but true silence
+                // (rms < EPSILON) is not normalized and stays at 0.0.
+                let rms =
+                    (audio.iter().map(|s| s * s).sum::<f32>() / audio.len().max(1) as f32).sqrt();
+                if rms < 0.002 {
+                    tracing::debug!(
+                        "device: {}, skipping deepgram — audio RMS {:.6} below silence threshold",
+                        device,
+                        rms
+                    );
+                    Ok(String::new())
+                } else {
+                    match transcribe_with_deepgram(
+                        api_key,
+                        audio,
+                        device,
+                        sample_rate,
+                        languages.clone(),
+                        vocabulary,
+                    )
+                    .await
+                    {
+                        Ok(t) => Ok(t),
+                        Err(e) => {
+                            error!("device: {}, deepgram transcription failed: {:?}", device, e);
+                            Err(e)
+                        }
                     }
                 }
             }
@@ -326,6 +358,8 @@ impl TranscriptionSession {
                 client,
                 languages,
                 vocabulary,
+                headers,
+                raw_audio,
             } => {
                 // Convert vocabulary entries to words for the API
                 let vocab_words: Vec<String> = vocabulary.iter().map(|v| v.word.clone()).collect();
@@ -339,6 +373,8 @@ impl TranscriptionSession {
                     sample_rate,
                     languages.clone(),
                     &vocab_words,
+                    headers.as_ref(),
+                    *raw_audio,
                 )
                 .await
                 {

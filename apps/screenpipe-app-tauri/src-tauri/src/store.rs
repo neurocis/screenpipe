@@ -26,9 +26,33 @@ pub fn get_store(
     let base_dir = get_base_dir(app, None)?;
     let store_path = base_dir.join("store.bin");
 
-    let store = StoreBuilder::new(app, store_path)
-        .build()
-        .map_err(|e| anyhow::anyhow!(e))?;
+    // Retry with backoff to handle TOCTOU race (EEXIST / os error 17)
+    // when multiple instances or threads race to create store.bin.
+    let mut last_err = None;
+    let store = 'retry: {
+        for attempt in 0..3u32 {
+            match StoreBuilder::new(app, store_path.clone()).build() {
+                Ok(s) => break 'retry s,
+                Err(e) => {
+                    let msg = e.to_string();
+                    if msg.contains("os error 17") || msg.contains("File exists") {
+                        tracing::warn!(
+                            "store build race (attempt {}): {}, retrying",
+                            attempt + 1,
+                            msg
+                        );
+                        std::thread::sleep(std::time::Duration::from_millis(
+                            100 * (attempt as u64 + 1),
+                        ));
+                        last_err = Some(e);
+                        continue;
+                    }
+                    return Err(anyhow::anyhow!(e));
+                }
+            }
+        }
+        return Err(anyhow::anyhow!(last_err.unwrap()));
+    };
 
     // If another thread raced us, use their instance
     Ok(STORE_CACHE.get_or_init(|| store).clone())
@@ -528,10 +552,7 @@ impl SettingsStore {
             // still opt back in manually from Settings; once they've seen this
             // version, we stop overriding their choice.
             if !obj.contains_key("restartNotificationsDefaultedOff") {
-                obj.insert(
-                    "showRestartNotifications".to_string(),
-                    Value::Bool(false),
-                );
+                obj.insert("showRestartNotifications".to_string(), Value::Bool(false));
                 obj.insert(
                     "restartNotificationsDefaultedOff".to_string(),
                     Value::Bool(true),
@@ -567,7 +588,6 @@ impl SettingsStore {
                     }
                 }
             }
-
         }
         val
     }
@@ -579,7 +599,12 @@ impl SettingsStore {
             true => Ok(None),
             false => {
                 let raw = store.get("settings").unwrap_or(Value::Null);
-                let sanitized = Self::sanitize_legacy_fields(raw);
+                let sanitized = Self::sanitize_legacy_fields(raw.clone());
+                // Persist sanitized fields back to store so the migration only warns once
+                if sanitized != raw {
+                    store.set("settings", sanitized.clone());
+                    let _ = store.save();
+                }
                 let settings = serde_json::from_value(sanitized);
                 match settings {
                     Ok(settings) => Ok(settings),
@@ -685,7 +710,10 @@ pub fn init_store(app: &AppHandle) -> Result<SettingsStore, String> {
         .unwrap_or(false);
 
     let (mut store, should_save) = match SettingsStore::get(app) {
-        Ok(Some(store)) => (store, should_persist_restart_notification_migration || needs_haiku_migration),
+        Ok(Some(store)) => (
+            store,
+            should_persist_restart_notification_migration || needs_haiku_migration,
+        ),
         Ok(None) => (SettingsStore::default(), true), // New store, save defaults
         Err(e) => {
             // Fallback to defaults when deserialization fails (e.g., corrupted store)
@@ -702,17 +730,19 @@ pub fn init_store(app: &AppHandle) -> Result<SettingsStore, String> {
     // One-time migration: move default Haiku users to Qwen3.5 Flash
     if needs_haiku_migration {
         for preset in &mut store.ai_presets {
-            let is_screenpipe = matches!(preset.provider, AIProviderType::Pi | AIProviderType::ScreenpipeCloud);
+            let is_screenpipe = matches!(
+                preset.provider,
+                AIProviderType::Pi | AIProviderType::ScreenpipeCloud
+            );
             if is_screenpipe && preset.model == "claude-haiku-4-5" {
                 tracing::info!("migrating default Haiku preset to Qwen3.5 Flash");
                 preset.model = "qwen/qwen3.5-flash-02-23".to_string();
             }
         }
         // Persist the flag so this runs only once
-        store.extra.insert(
-            "haikuToQwenFlashMigrated".to_string(),
-            Value::Bool(true),
-        );
+        store
+            .extra
+            .insert("haikuToQwenFlashMigrated".to_string(), Value::Bool(true));
     }
 
     if should_save {
@@ -877,8 +907,7 @@ impl PipeSuggestionsSettingsStore {
         if store.is_empty() {
             return Ok(None);
         }
-        let settings =
-            serde_json::from_value(store.get("pipe_suggestions").unwrap_or(Value::Null));
+        let settings = serde_json::from_value(store.get("pipe_suggestions").unwrap_or(Value::Null));
         match settings {
             Ok(settings) => Ok(settings),
             Err(_) => Ok(None),
@@ -891,4 +920,3 @@ impl PipeSuggestionsSettingsStore {
         store.save().map_err(|e| e.to_string())
     }
 }
-

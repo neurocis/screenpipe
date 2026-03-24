@@ -66,6 +66,10 @@ pub struct OpenAICompatibleConfig {
     pub api_key: Option<String>,
     pub model: String,
     pub client: Option<Arc<Client>>,
+    /// Custom HTTP headers to include in transcription requests.
+    pub headers: Option<std::collections::HashMap<String, String>>,
+    /// Send raw WAV audio instead of MP3.
+    pub raw_audio: bool,
 }
 
 impl Default for OpenAICompatibleConfig {
@@ -75,6 +79,8 @@ impl Default for OpenAICompatibleConfig {
             api_key: None,
             model: DEFAULT_OPENAI_COMPATIBLE_MODEL.to_string(),
             client: None,
+            headers: None,
+            raw_audio: false,
         }
     }
 }
@@ -150,27 +156,41 @@ pub async fn stt(
     {
         Ok(String::new())
     } else if audio_transcription_engine == AudioTranscriptionEngine::Deepgram.into() {
-        // Deepgram implementation
-        let api_key = deepgram_api_key.unwrap_or_default();
+        // Deepgram is a paid API — skip if audio is near-silence to avoid burning costs.
+        // Empirical RMS values from real captures (see audio_manager/manager.rs):
+        //   output silence = 0.0, output audio playing = 0.0028, loud output = 0.06
+        //   input silence ≈ 0.0, input speech ≈ 0.05+
+        // 0.002 is above electrical hum but below any real audio content.
+        let rms = (audio.iter().map(|s| s * s).sum::<f32>() / audio.len() as f32).sqrt();
+        if rms < 0.002 {
+            tracing::debug!(
+                "device: {}, skipping deepgram — audio RMS {:.6} below silence threshold",
+                device,
+                rms
+            );
+            Ok(String::new())
+        } else {
+            let api_key = deepgram_api_key.unwrap_or_default();
 
-        match transcribe_with_deepgram(
-            &api_key,
-            audio,
-            device,
-            sample_rate,
-            languages.clone(),
-            vocabulary,
-        )
-        .await
-        {
-            Ok(transcription) => Ok(transcription),
-            Err(e) => {
-                error!(
-                    "device: {}, deepgram transcription failed, falling back to Whisper: {:?}",
-                    device, e
-                );
-                // Fallback to Whisper
-                process_with_whisper(audio, languages.clone(), whisper_state, vocabulary).await
+            match transcribe_with_deepgram(
+                &api_key,
+                audio,
+                device,
+                sample_rate,
+                languages.clone(),
+                vocabulary,
+            )
+            .await
+            {
+                Ok(transcription) => Ok(transcription),
+                Err(e) => {
+                    error!(
+                        "device: {}, deepgram transcription failed, falling back to Whisper: {:?}",
+                        device, e
+                    );
+                    // Fallback to Whisper
+                    process_with_whisper(audio, languages.clone(), whisper_state, vocabulary).await
+                }
             }
         }
     } else if *audio_transcription_engine == AudioTranscriptionEngine::Qwen3Asr {
@@ -200,6 +220,8 @@ pub async fn stt(
             sample_rate,
             languages.clone(),
             &vocab_words,
+            config.headers.as_ref(),
+            config.raw_audio,
         )
         .await
         {

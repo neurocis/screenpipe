@@ -20,15 +20,15 @@ use super::focus::{restore_frontmost_app, restore_frontmost_app_if_external_with
 use super::panel::{main_label_for_mode, MAIN_CREATED_MODE};
 #[cfg(target_os = "macos")]
 use super::panel::{show_panel_visible, MAIN_PANEL_SHOWN};
-use super::util::screen_aware_size;
 #[cfg(target_os = "macos")]
 use super::util::run_on_main_thread_safe;
+use super::util::screen_aware_size;
 
+use tauri::Emitter;
 #[cfg(target_os = "macos")]
 use tauri_nspanel::ManagerExt;
 #[cfg(target_os = "macos")]
 use tauri_nspanel::WebviewWindowExt;
-use tauri::Emitter;
 
 #[derive(PartialEq)]
 pub enum RewindWindowId {
@@ -494,7 +494,8 @@ impl ShowRewindWindow {
 
                                 // Move the window to the active space (current workspace)
                                 // NSWindowCollectionBehaviorMoveToActiveSpace = 1 << 1 = 2
-                                let behavior: u64 = msg_send![ns_win as cocoa_id, collectionBehavior];
+                                let behavior: u64 =
+                                    msg_send![ns_win as cocoa_id, collectionBehavior];
                                 let move_to_active: u64 = 1 << 1;
                                 let _: () = msg_send![ns_win as cocoa_id, setCollectionBehavior: behavior | move_to_active];
 
@@ -535,8 +536,8 @@ impl ShowRewindWindow {
                     let settings = SettingsStore::get(app)
                         .unwrap_or_default()
                         .unwrap_or_default();
-                    let capturable = crate::config::is_e2e_mode()
-                        || settings.show_overlay_in_screen_recording;
+                    let capturable =
+                        crate::config::is_e2e_mode() || settings.show_overlay_in_screen_recording;
                     let chat_on_top = settings.chat_always_on_top;
                     let app_clone = app.clone();
                     run_on_main_thread_safe(app, move || {
@@ -654,8 +655,8 @@ impl ShowRewindWindow {
                     .unwrap_or_default();
                 let overlay_mode = settings.overlay_mode;
                 #[allow(unused_variables)] // used only on macOS
-                let show_in_recording = crate::config::is_e2e_mode()
-                    || settings.show_overlay_in_screen_recording;
+                let show_in_recording =
+                    crate::config::is_e2e_mode() || settings.show_overlay_in_screen_recording;
                 // Record what mode we're creating so we can detect changes later
                 *MAIN_CREATED_MODE.lock().unwrap_or_else(|e| e.into_inner()) = overlay_mode.clone();
                 let use_window_mode = overlay_mode == "window";
@@ -675,7 +676,11 @@ impl ShowRewindWindow {
                         // and tray on notched MacBooks. NSPanel with proper collection
                         // behaviors handles fullscreen Space visibility instead.
                         let builder = self
-                            .window_builder_with_label(app, "/", main_label_for_mode("window"))
+                            .window_builder_with_label(
+                                app,
+                                "/overlay",
+                                main_label_for_mode("window"),
+                            )
                             .title("screenpipe")
                             .inner_size(win_w, win_h)
                             .min_inner_size(800.0, 600.0)
@@ -691,7 +696,11 @@ impl ShowRewindWindow {
                     let window = {
                         let app_clone = app.clone();
                         let builder = self
-                            .window_builder_with_label(app, "/", main_label_for_mode("window"))
+                            .window_builder_with_label(
+                                app,
+                                "/overlay",
+                                main_label_for_mode("window"),
+                            )
                             .title("screenpipe")
                             .inner_size(win_w, win_h)
                             .min_inner_size(800.0, 600.0)
@@ -923,7 +932,11 @@ impl ShowRewindWindow {
                         min.1.min(logical_size.height),
                     );
                     let builder = self
-                        .window_builder_with_label(app, "/", main_label_for_mode("fullscreen"))
+                        .window_builder_with_label(
+                            app,
+                            "/overlay",
+                            main_label_for_mode("fullscreen"),
+                        )
                         .always_on_top(true)
                         .decorations(false)
                         .skip_taskbar(true)
@@ -971,8 +984,13 @@ impl ShowRewindWindow {
                         min.0.min(logical_size.width),
                         min.1.min(logical_size.height),
                     );
+                    let app_clone = app.clone();
                     let builder = self
-                        .window_builder_with_label(app, "/", main_label_for_mode("fullscreen"))
+                        .window_builder_with_label(
+                            app,
+                            "/overlay",
+                            main_label_for_mode("fullscreen"),
+                        )
                         .title("screenpipe")
                         .visible_on_all_workspaces(true)
                         .always_on_top(true)
@@ -980,7 +998,7 @@ impl ShowRewindWindow {
                         .resizable(false)
                         .maximizable(false)
                         .minimizable(false)
-                        .focused(true)
+                        .focused(false)
                         .transparent(true)
                         .visible(false)
                         .skip_taskbar(true)
@@ -988,15 +1006,26 @@ impl ShowRewindWindow {
                         .min_inner_size(clamped_min.0, clamped_min.1)
                         .inner_size(logical_size.width, logical_size.height)
                         .max_inner_size(logical_size.width, logical_size.height)
-                        .position(position.x as f64, position.y as f64);
-                    let win = builder.build()?;
-
-                    // Setup Win32 overlay with click-through disabled so user can interact
-                    if let Err(e) = crate::windows_overlay::setup_overlay(&win, false) {
-                        error!("Failed to setup Windows overlay: {}", e);
-                    }
-
-                    win
+                        .position(position.x as f64, position.y as f64)
+                        .on_page_load(move |win, payload| {
+                            if matches!(
+                                payload.event(),
+                                tauri::webview::PageLoadEvent::Finished
+                            ) {
+                                // Setup Win32 overlay AFTER webview loads so the
+                                // window becomes visible only when JS is ready
+                                // to handle keyboard events.
+                                if let Err(e) = crate::windows_overlay::setup_overlay(win, false) {
+                                    tracing::error!("Failed to setup Windows overlay: {}", e);
+                                }
+                                // Activate so keyboard focus goes to the webview
+                                if let Err(e) = crate::windows_overlay::bring_to_front_and_activate(win) {
+                                    tracing::error!("Failed to activate overlay: {}", e);
+                                }
+                                let _ = app_clone.emit("window-focused", true);
+                            }
+                        });
+                    builder.build()?
                 };
 
                 // Linux uses a normal decorated window (overlay not yet implemented).
@@ -1007,7 +1036,11 @@ impl ShowRewindWindow {
                     let (linux_w, linux_h) = screen_aware_size(app, 1200.0, 800.0);
                     let app_clone = app.clone();
                     let builder = self
-                        .window_builder_with_label(app, "/", main_label_for_mode("fullscreen"))
+                        .window_builder_with_label(
+                            app,
+                            "/overlay",
+                            main_label_for_mode("fullscreen"),
+                        )
                         .title("screenpipe")
                         .inner_size(linux_w, linux_h)
                         .min_inner_size(800.0, 600.0)
@@ -1426,14 +1459,14 @@ impl ShowRewindWindow {
                                     msg_send![&*panel, setMovableByWindowBackground: true]
                                 };
 
-                            // NSWindowSharingNone=0 hides from screen recorders, NSWindowSharingReadOnly=1 allows capture
-                            let capturable = crate::config::is_e2e_mode()
-                                || SettingsStore::get(window_clone.app_handle())
-                                    .unwrap_or_default()
-                                    .unwrap_or_default()
-                                    .show_overlay_in_screen_recording;
-                            let sharing: u64 = if capturable { 1 } else { 0 };
-                            let _: () = unsafe { msg_send![&*panel, setSharingType: sharing] };
+                                // NSWindowSharingNone=0 hides from screen recorders, NSWindowSharingReadOnly=1 allows capture
+                                let capturable = crate::config::is_e2e_mode()
+                                    || SettingsStore::get(window_clone.app_handle())
+                                        .unwrap_or_default()
+                                        .unwrap_or_default()
+                                        .show_overlay_in_screen_recording;
+                                let sharing: u64 = if capturable { 1 } else { 0 };
+                                let _: () = unsafe { msg_send![&*panel, setSharingType: sharing] };
 
                                 // MoveToActiveSpace so show_existing can pull
                                 // it to any Space (including fullscreen).

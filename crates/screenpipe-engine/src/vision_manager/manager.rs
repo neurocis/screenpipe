@@ -35,6 +35,7 @@ pub struct VisionManagerConfig {
     pub use_all_monitors: bool,
     /// Automatically detect and skip incognito / private browsing windows.
     pub ignore_incognito_windows: bool,
+    /// Pause all screen capture when a DRM streaming app (Netflix, etc.) is focused.
     pub pause_on_drm_content: bool,
     /// Languages for OCR recognition.
     pub languages: Vec<screenpipe_core::Language>,
@@ -351,12 +352,24 @@ impl VisionManager {
 
         for id in &dead {
             if let Some((_, handle)) = self.recording_tasks.remove(id) {
-                warn!(
-                    "Monitor {} capture task died unexpectedly, removing so it can be restarted",
-                    id
-                );
-                // Await to clean up the JoinHandle
-                let _ = handle.await;
+                // Await to clean up the JoinHandle and capture exit reason
+                match handle.await {
+                    Ok(()) => {
+                        warn!(
+                            "monitor {} capture task exited (see prior error log for cause), will be restarted by monitor watcher",
+                            id
+                        );
+                    }
+                    Err(e) if e.is_cancelled() => {
+                        info!("monitor {} capture task was cancelled", id);
+                    }
+                    Err(e) => {
+                        error!(
+                            "monitor {} capture task panicked: {}, will be restarted by monitor watcher",
+                            id, e
+                        );
+                    }
+                }
             }
         }
 

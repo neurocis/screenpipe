@@ -78,6 +78,8 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
+                None,
             )
             .await
             .unwrap();
@@ -128,6 +130,8 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
+                None,
             )
             .await
             .unwrap();
@@ -139,6 +143,8 @@ mod tests {
                 ContentType::Audio,
                 100,
                 0,
+                None,
+                None,
                 None,
                 None,
                 None,
@@ -207,6 +213,8 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
+                None,
             )
             .await
             .unwrap();
@@ -218,6 +226,8 @@ mod tests {
                 ContentType::Audio,
                 100,
                 0,
+                None,
+                None,
                 None,
                 None,
                 None,
@@ -281,8 +291,8 @@ mod tests {
         .unwrap();
 
         // Verify that frames_fts was populated
-        let fts_data: Option<(i64, String, String, String, bool)> = sqlx::query_as(
-            "SELECT rowid, browser_url, app_name, window_name, focused FROM frames_fts WHERE rowid = ?",
+        let fts_data: Option<(i64, String, String, String)> = sqlx::query_as(
+            "SELECT rowid, browser_url, app_name, window_name FROM frames_fts WHERE rowid = ?",
         )
         .bind(frame_id)
         .fetch_optional(&db.pool)
@@ -326,6 +336,8 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
+                None,
             )
             .await
             .unwrap();
@@ -337,6 +349,8 @@ mod tests {
                 ContentType::All,
                 100,
                 0,
+                None,
+                None,
                 None,
                 None,
                 None,
@@ -469,12 +483,11 @@ mod tests {
         println!("Frames FTS data (full_text): {:?}", ocr_fts_data);
 
         // check if frames_fts is properly indexed
-        let frame_fts_data: Vec<(i64, String, String, String, bool)> = sqlx::query_as(
-            "SELECT id, browser_url, app_name, window_name, focused FROM frames_fts",
-        )
-        .fetch_all(&db.pool)
-        .await
-        .unwrap();
+        let frame_fts_data: Vec<(i64, String, String, String)> =
+            sqlx::query_as("SELECT id, browser_url, app_name, window_name FROM frames_fts")
+                .fetch_all(&db.pool)
+                .await
+                .unwrap();
         println!("Frames FTS data: {:?}", frame_fts_data);
 
         let insert_result = db
@@ -538,6 +551,8 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
+                None,
             )
             .await
             .unwrap();
@@ -563,6 +578,8 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
+                None,
             )
             .await
             .unwrap();
@@ -578,6 +595,8 @@ mod tests {
                 0,
                 Some(mid_time),
                 Some(end_time),
+                None,
+                None,
                 None,
                 None,
                 None,
@@ -615,6 +634,8 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
+                None,
             )
             .await
             .unwrap();
@@ -629,6 +650,8 @@ mod tests {
                 0,
                 Some(start_time),
                 Some(end_time),
+                None,
+                None,
                 None,
                 None,
                 None,
@@ -756,6 +779,8 @@ mod tests {
                 0,
                 Some(mid_time),
                 Some(end_time),
+                None,
+                None,
                 None,
                 None,
                 None,
@@ -1249,6 +1274,8 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
+                None,
             )
             .await
             .unwrap();
@@ -1277,6 +1304,8 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
+                None,
             )
             .await
             .unwrap();
@@ -1302,6 +1331,8 @@ mod tests {
                 None,
                 None,
                 Some("test_video"),
+                None,
+                None,
                 None,
                 None,
                 None,
@@ -1387,24 +1418,10 @@ mod tests {
         .await
         .unwrap();
 
-        // Insert accessibility data (replaces legacy ui_monitoring table)
-        sqlx::query(
-            r#"
-            INSERT INTO accessibility (
-                text_content,
-                timestamp,
-                app_name,
-                window_name
-            ) VALUES (?, ?, ?, ?)
-            "#,
-        )
-        .bind("Hello from UI")
-        .bind(Utc::now())
-        .bind("test_app")
-        .bind("test_window")
-        .execute(&db.pool)
-        .await
-        .unwrap();
+        // Insert accessibility data
+        db.insert_accessibility_text("test_app", "test_window", "Hello from UI", None)
+            .await
+            .unwrap();
 
         // Test count with All content types
         let count = db
@@ -1560,6 +1577,8 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
+                None,
             )
             .await
             .unwrap();
@@ -1656,6 +1675,8 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
+                None,
             )
             .await
             .unwrap();
@@ -1670,6 +1691,8 @@ mod tests {
                 0,
                 Some(mid),
                 Some(after),
+                None,
+                None,
                 None,
                 None,
                 None,
@@ -1725,6 +1748,8 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
+                None,
             )
             .await
             .unwrap();
@@ -1753,6 +1778,8 @@ mod tests {
                 ContentType::Accessibility,
                 100,
                 0,
+                None,
+                None,
                 None,
                 None,
                 None,
@@ -1797,6 +1824,8 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
+                None,
             )
             .await
             .unwrap();
@@ -1819,6 +1848,8 @@ mod tests {
                 ContentType::All,
                 100,
                 0,
+                None,
+                None,
                 None,
                 None,
                 None,
@@ -1868,6 +1899,8 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
+                None,
             )
             .await
             .unwrap();
@@ -1900,6 +1933,8 @@ mod tests {
                 ContentType::Accessibility,
                 100,
                 0,
+                None,
+                None,
                 None,
                 None,
                 None,

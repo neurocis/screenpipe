@@ -31,6 +31,7 @@ import {
   Phone,
   Sparkles,
   Bell,
+  BarChart3,
 } from "lucide-react";
 import { useOverlayData } from "@/app/shortcut-reminder/use-overlay-data";
 import { cn } from "@/lib/utils";
@@ -50,6 +51,7 @@ import { StorageSection } from "@/components/settings/storage-section";
 import { MeetingsSection } from "@/components/settings/meetings-section";
 import { MemoriesSection } from "@/components/settings/memories-section";
 import { NotificationsSettings } from "@/components/settings/notifications-settings";
+import { UsageSection } from "@/components/settings/usage-section";
 import { StandaloneChat } from "@/components/standalone-chat";
 import Timeline from "@/components/rewind/timeline";
 import { useQueryState } from "nuqs";
@@ -84,7 +86,8 @@ type SettingsModalSection =
   | "memories"
   | "team"
   | "notifications"
-  | "referral";
+  | "referral"
+  | "usage";
 
 type SettingsModalSectionItem = {
   id: SettingsModalSection;
@@ -97,14 +100,14 @@ type SettingsModalSectionItem = {
 const ALL_SECTIONS = [
   "home", "timeline", "pipes", "help",
   "account", "recording", "ai", "general", "display", "shortcuts", "notifications",
-  "connections", "privacy", "storage", "meetings", "memories", "team", "referral",
+  "connections", "privacy", "storage", "meetings", "memories", "team", "referral", "usage",
   "feedback", // backwards compat → maps to "help"
   "disk-usage", "cloud-archive", "cloud-sync", // backwards compat → maps to "storage"
 ];
 
 const MODAL_SECTIONS = new Set<string>([
   "account", "recording", "ai", "general", "display", "shortcuts", "notifications",
-  "connections", "privacy", "storage", "meetings", "memories", "team", "referral",
+  "connections", "privacy", "storage", "meetings", "memories", "team", "referral", "usage",
 ]);
 
 function SettingsPageContent() {
@@ -320,6 +323,8 @@ function SettingsPageContent() {
         return <NotificationsSettings />;
       case "referral":
         return <ReferralSection />;
+      case "usage":
+        return <UsageSection />;
     }
   };
 
@@ -340,6 +345,7 @@ function SettingsPageContent() {
     { id: "ai", label: "AI models", icon: <Brain className="h-4 w-4" />, group: "app" },
     { id: "shortcuts", label: "Shortcuts", icon: <Keyboard className="h-4 w-4" />, group: "app" },
     { id: "notifications", label: "Notifications", icon: <Bell className="h-4 w-4" />, group: "app" },
+    { id: "usage", label: "Usage", icon: <BarChart3 className="h-4 w-4" />, group: "data" },
     { id: "privacy", label: "Privacy", icon: <Shield className="h-4 w-4" />, group: "data" },
     { id: "storage", label: "Storage", icon: <HardDrive className="h-4 w-4" />, group: "data" },
     { id: "meetings", label: "Meetings", icon: <Phone className="h-4 w-4" />, group: "data" },

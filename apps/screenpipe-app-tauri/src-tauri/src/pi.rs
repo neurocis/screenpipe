@@ -371,7 +371,6 @@ impl PiManager {
     pub fn is_running(&mut self) -> bool {
         self.check_alive()
     }
-
 }
 
 /// Get the Pi config directory (~/.pi/agent)
@@ -728,52 +727,61 @@ fn ensure_pi_config(
                 "https://chatgpt.com/backend-api".to_string()
             } else if config.provider == "anthropic" && config.url.is_empty() {
                 "https://api.anthropic.com".to_string()
-            } else if config.provider == "anthropic" && config.url.is_empty() {
-                "https://api.anthropic.com".to_string()
+            } else if config.provider == "openai" && config.url.is_empty() {
+                "https://api.openai.com/v1".to_string()
             } else {
                 config.url.clone()
             };
 
-            // Pi resolves apiKey values as env var names, so reference the env var
-            // we'll set when spawning the process
-            let api_key = match config.provider.as_str() {
-                "native-ollama" => "ollama".to_string(), // Ollama ignores API key but Pi requires one
-                "openai" => "OPENAI_API_KEY".to_string(), // Pi will read from env
-                "openai-chatgpt" => "OPENAI_CHATGPT_TOKEN".to_string(), // OAuth token from env
-                "anthropic" => "ANTHROPIC_API_KEY".to_string(), // Pi will read from env
-                "anthropic" => "ANTHROPIC_API_KEY".to_string(), // OAuth token injected at startup
-                "custom" => "CUSTOM_API_KEY".to_string(), // Pi will read from env
-                _ => "".to_string(),
-            };
-
-            let wire_api = if config.provider == "openai-chatgpt" {
-                "openai-codex-responses"
-            } else if config.provider == "anthropic" {
-                "anthropic-messages"
+            // Pi's models.json schema requires baseUrl to have minLength: 1.
+            // Writing an empty baseUrl poisons the entire file and breaks ALL
+            // providers (including screenpipe cloud). Skip the entry instead.
+            if base_url.is_empty() {
+                warn!(
+                    "skipping pi provider '{}': no baseUrl configured (would invalidate models.json)",
+                    provider_name
+                );
             } else {
-                "openai-completions"
-            };
+                // Pi resolves apiKey values as env var names, so reference the env var
+                // we'll set when spawning the process
+                let api_key = match config.provider.as_str() {
+                    "native-ollama" => "ollama".to_string(), // Ollama ignores API key but Pi requires one
+                    "openai" => "OPENAI_API_KEY".to_string(), // Pi will read from env
+                    "openai-chatgpt" => "OPENAI_CHATGPT_TOKEN".to_string(), // OAuth token from env
+                    "anthropic" => "ANTHROPIC_API_KEY".to_string(), // Pi will read from env
+                    "custom" => "CUSTOM_API_KEY".to_string(), // Pi will read from env
+                    _ => "".to_string(),
+                };
 
-            let user_provider = json!({
-                "baseUrl": base_url,
-                "api": wire_api,
-                "apiKey": api_key,
-                "models": [
-                    {
-                        "id": config.model,
-                        "name": config.model,
-                        "input": ["text", "image"],
-                        "maxTokens": config.max_tokens,
-                        "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0}
-                    }
-                ]
-            });
+                let wire_api = if config.provider == "openai-chatgpt" {
+                    "openai-codex-responses"
+                } else if config.provider == "anthropic" {
+                    "anthropic-messages"
+                } else {
+                    "openai-completions"
+                };
 
-            if let Some(providers) = models_config
-                .get_mut("providers")
-                .and_then(|p| p.as_object_mut())
-            {
-                providers.insert(provider_name.to_string(), user_provider);
+                let user_provider = json!({
+                    "baseUrl": base_url,
+                    "api": wire_api,
+                    "apiKey": api_key,
+                    "models": [
+                        {
+                            "id": config.model,
+                            "name": config.model,
+                            "input": ["text", "image"],
+                            "maxTokens": config.max_tokens,
+                            "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0}
+                        }
+                    ]
+                });
+
+                if let Some(providers) = models_config
+                    .get_mut("providers")
+                    .and_then(|p| p.as_object_mut())
+                {
+                    providers.insert(provider_name.to_string(), user_provider);
+                }
             }
         }
     }
@@ -909,10 +917,12 @@ fn kill_orphan_pi_processes(managed_alive: bool) {
 }
 
 /// Max time to wait for Pi to emit its first stdout line (readiness handshake).
-/// Pi RPC mode doesn't emit anything until it receives a command, so this is
-/// effectively a "wait for the process to be alive and accepting stdin" timeout.
-/// Keep this short — the process is ready as soon as it starts the readline loop.
-const PI_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+/// Pi RPC mode doesn't emit anything until it receives a command, so this
+/// always times out — it's just a grace period to let bun finish loading before
+/// we check if the process crashed. Bun 1.3+ accepts stdin immediately after
+/// spawn (the old 2s delay was needed for bun 1.2's readline pipe bug), so
+/// 200ms is enough to detect immediate-exit crashes without delaying first chat.
+const PI_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(200);
 
 /// Resolve a model name for the screenpipe provider.
 ///
@@ -988,7 +998,8 @@ pub async fn pi_start_inner(
                 "openai-chatgpt" => "openai-chatgpt",
                 "native-ollama" => "ollama",
                 "anthropic" => "anthropic-byok",
-                "custom" => "custom",
+                // "custom" requires a valid URL; fall back to screenpipe cloud if missing
+                "custom" if !config.url.is_empty() => "custom",
                 "screenpipe-cloud" | "pi" | _ => "screenpipe",
             };
             let model = resolve_screenpipe_model(&config.model, provider_name);
@@ -1302,10 +1313,7 @@ pub async fn pi_start_inner(
     }
 
     // Grab queue_state for the stdout reader before dropping the lock
-    let queue_state_for_reader = pool
-        .sessions
-        .get(&sid)
-        .and_then(|m| m.queue_state.clone());
+    let queue_state_for_reader = pool.sessions.get(&sid).and_then(|m| m.queue_state.clone());
 
     // Snapshot the state BEFORE dropping the lock, so we don't hold it during I/O
     let snapshot = match pool.sessions.get_mut(&sid) {
@@ -1391,7 +1399,9 @@ pub async fn pi_start_inner(
                         if let Some(id) = event.get("id").and_then(|v| v.as_str()) {
                             let mut pending = pending_for_reader.lock().unwrap();
                             if let Some(tx) = pending.remove(id) {
-                                if let Ok(rpc) = serde_json::from_value::<RpcResponse>(event.clone()) {
+                                if let Ok(rpc) =
+                                    serde_json::from_value::<RpcResponse>(event.clone())
+                                {
                                     let _ = tx.send(rpc);
                                 }
                             }
@@ -1538,7 +1548,9 @@ pub async fn pi_prompt(
             return Err("Pi is not running".to_string());
         }
         m.last_activity = std::time::Instant::now();
-        m.queue_handle.clone().ok_or("Pi command queue not initialized")?
+        m.queue_handle
+            .clone()
+            .ok_or("Pi command queue not initialized")?
     };
 
     let mut cmd = json!({
@@ -1554,7 +1566,8 @@ pub async fn pi_prompt(
     let rx = queue
         .send(cmd, crate::pi_command_queue::WaitMode::StreamThenWaitDone)
         .await?;
-    rx.await.map_err(|_| "Pi command queue dropped".to_string())?
+    rx.await
+        .map_err(|_| "Pi command queue dropped".to_string())?
 }
 
 /// Abort current Pi operation. Priority command — cancels all pending commands
@@ -1570,7 +1583,9 @@ pub async fn pi_abort(state: State<'_, PiState>, session_id: Option<String>) -> 
             return Err("Pi is not running".to_string());
         }
         m.last_activity = std::time::Instant::now();
-        m.queue_handle.clone().ok_or("Pi command queue not initialized")?
+        m.queue_handle
+            .clone()
+            .ok_or("Pi command queue not initialized")?
     };
     queue.abort().await
 }
@@ -1592,7 +1607,9 @@ pub async fn pi_new_session(
             return Err("Pi is not running".to_string());
         }
         m.last_activity = std::time::Instant::now();
-        m.queue_handle.clone().ok_or("Pi command queue not initialized")?
+        m.queue_handle
+            .clone()
+            .ok_or("Pi command queue not initialized")?
     };
     let rx = queue
         .send(
@@ -1600,7 +1617,8 @@ pub async fn pi_new_session(
             crate::pi_command_queue::WaitMode::WaitDone,
         )
         .await?;
-    rx.await.map_err(|_| "Pi command queue dropped".to_string())?
+    rx.await
+        .map_err(|_| "Pi command queue dropped".to_string())?
 }
 
 /// Check if pi is available
@@ -2077,7 +2095,10 @@ pub fn ensure_pi_installed_background() {
                     info!("Pi installed but missing lru-cache overrides — patching");
                 }
                 if needs_upgrade {
-                    info!("Pi version mismatch — upgrading to {} in background", PI_PACKAGE);
+                    info!(
+                        "Pi version mismatch — upgrading to {} in background",
+                        PI_PACKAGE
+                    );
                 }
                 seed_pi_package_json(&install_dir);
                 if needs_lru_fix {
@@ -2561,7 +2582,7 @@ mod tests {
     /// Test PI_READY_TIMEOUT constant is sensible
     #[test]
     fn test_ready_timeout_constant() {
-        assert_eq!(super::PI_READY_TIMEOUT.as_secs(), 2);
+        assert_eq!(super::PI_READY_TIMEOUT.as_millis(), 200);
     }
 
     // -- read_lines_lossy unit tests --

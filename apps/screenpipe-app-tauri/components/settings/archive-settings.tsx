@@ -116,7 +116,8 @@ export function ArchiveSettings() {
 
     try {
       if (enabled) {
-        // Initialize archive — encryption key is derived server-side from the token
+        // Initialize archive — encryption keys are derived locally from the
+        // token, completely independent of cloud sync.
         const res = await fetch("http://localhost:3030/archive/init", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -135,16 +136,16 @@ export function ArchiveSettings() {
         await persistArchiveStore(true, retentionDays);
         toast({ title: "Cloud archive enabled" });
       } else {
-        // Disable archive
-        const res = await fetch("http://localhost:3030/archive/configure", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ enabled: false }),
-        });
-
-        if (!res.ok) {
-          const data = await res.json();
-          throw new Error(data.error || "failed to disable archive");
+        // Disable archive — always update local settings even if server
+        // is unreachable (the intent is to turn it off).
+        try {
+          await fetch("http://localhost:3030/archive/configure", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ enabled: false }),
+          });
+        } catch {
+          // Server unreachable — still disable locally
         }
 
         await updateSettings({ cloudArchiveEnabled: false });

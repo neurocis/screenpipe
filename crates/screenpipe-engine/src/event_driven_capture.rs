@@ -231,6 +231,7 @@ pub async fn event_driven_capture_loop(
     let mut state = EventDrivenCapture::new(config);
     let mut power_profile_rx = power_profile_rx;
     let poll_interval = Duration::from_millis(50);
+    let mut trigger_channel_closed = false;
 
     // Frame comparer for visual change detection
     let mut frame_comparer = if visual_check_enabled {
@@ -325,6 +326,7 @@ pub async fn event_driven_capture_loop(
             continue;
         }
 
+        // Skip capture while DRM streaming content is focused
         if crate::drm_detector::drm_content_paused() {
             tokio::time::sleep(poll_interval).await;
             continue;
@@ -347,24 +349,35 @@ pub async fn event_driven_capture_loop(
             }
         }
 
-        // Check for external triggers (non-blocking)
-        let mut trigger = match trigger_rx.try_recv() {
-            Ok(trigger) => Some(trigger),
-            Err(broadcast::error::TryRecvError::Empty) => {
-                // Poll activity feed for state transitions
-                state.poll_activity(&activity_feed)
-            }
-            Err(broadcast::error::TryRecvError::Lagged(n)) => {
-                debug!(
-                    "trigger channel lagged by {} messages on monitor {}",
-                    n, monitor_id
-                );
-                // Drain missed triggers, just capture now
-                Some(CaptureTrigger::Manual)
-            }
-            Err(broadcast::error::TryRecvError::Closed) => {
-                warn!("trigger channel closed for monitor {}", monitor_id);
-                break;
+        // Check for external triggers (non-blocking).
+        // Once the channel is closed, skip try_recv and rely on polling only.
+        let mut trigger = if trigger_channel_closed {
+            state.poll_activity(&activity_feed)
+        } else {
+            match trigger_rx.try_recv() {
+                Ok(trigger) => Some(trigger),
+                Err(broadcast::error::TryRecvError::Empty) => {
+                    // Poll activity feed for state transitions
+                    state.poll_activity(&activity_feed)
+                }
+                Err(broadcast::error::TryRecvError::Lagged(n)) => {
+                    debug!(
+                        "trigger channel lagged by {} messages on monitor {}",
+                        n, monitor_id
+                    );
+                    // Drain missed triggers, just capture now
+                    Some(CaptureTrigger::Manual)
+                }
+                Err(broadcast::error::TryRecvError::Closed) => {
+                    // Don't break — fall through to activity feed polling and visual
+                    // change detection so capture keeps working even without UI triggers.
+                    warn!(
+                        "trigger channel closed for monitor {}, continuing with polling-only mode",
+                        monitor_id
+                    );
+                    trigger_channel_closed = true;
+                    state.poll_activity(&activity_feed)
+                }
             }
         };
 
@@ -799,8 +812,9 @@ async fn do_capture(
         });
     }
 
-    // DRM content detection: set global pause flag so monitor watcher
-    // stops all monitors and releases SCK handles.
+    // DRM content detection: check if the focused app/URL is a streaming service.
+    // When detected, set the global pause flag so ALL monitors stop capture
+    // and the monitor watcher releases all SCK handles.
     if crate::drm_detector::check_and_update_drm_state(
         pause_on_drm_content,
         app_name_owned.as_deref(),

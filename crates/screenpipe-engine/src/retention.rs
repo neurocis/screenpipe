@@ -57,7 +57,7 @@ impl Default for RetentionConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            retention_days: 30,
+            retention_days: 14,
         }
     }
 }
@@ -90,7 +90,7 @@ pub async fn retention_configure(
     State(state): State<Arc<AppState>>,
     Json(request): Json<RetentionConfigureRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let retention_days = request.retention_days.unwrap_or(30);
+    let retention_days = request.retention_days.unwrap_or(14);
 
     // Enforce minimum 1 day
     if retention_days < 1 {
@@ -301,37 +301,83 @@ fn spawn_retention_loop(
 }
 
 async fn do_local_cleanup(db: &Arc<DatabaseManager>, cutoff: DateTime<Utc>) -> anyhow::Result<u64> {
-    let epoch = DateTime::<Utc>::MIN_UTC;
-    let result = db.delete_time_range_local(epoch, cutoff).await?;
+    // Delete in 1-hour batches. Each batch only deletes time-bounded rows
+    // (fast, uses indexed timestamp). The expensive orphan cleanup (full-table
+    // NOT IN scans on video_chunks/audio_chunks) runs once at the end.
+    let batch_size = Duration::hours(1);
+    let mut total: u64 = 0;
 
-    let total = result.frames_deleted
-        + result.ocr_deleted
-        + result.audio_transcriptions_deleted
-        + result.ui_events_deleted;
+    let oldest = match db.get_oldest_timestamp().await {
+        Ok(Some(ts)) => ts,
+        Ok(None) => return Ok(0),
+        Err(e) => {
+            warn!("retention: failed to get oldest timestamp: {}", e);
+            return Ok(0);
+        }
+    };
 
-    if total > 0 {
-        info!(
-            "retention: deleted frames={} ocr={} audio={} ui_events={} \
-             (video_files={} snapshot_files={} audio_files={})",
-            result.frames_deleted,
-            result.ocr_deleted,
-            result.audio_transcriptions_deleted,
-            result.ui_events_deleted,
-            result.video_files.len(),
-            result.snapshot_files.len(),
-            result.audio_files.len(),
-        );
+    let mut batch_start = oldest;
+    let mut any_deleted = false;
+
+    while batch_start < cutoff {
+        let batch_end = (batch_start + batch_size).min(cutoff);
+
+        match db
+            .delete_time_range_batch(batch_start, batch_end, true)
+            .await
+        {
+            Ok(result) => {
+                let batch_total = result.frames_deleted
+                    + result.ocr_deleted
+                    + result.audio_transcriptions_deleted
+                    + result.ui_events_deleted;
+
+                if batch_total > 0 {
+                    any_deleted = true;
+                    info!(
+                        "retention: batch deleted frames={} ocr={} audio={} ui_events={} \
+                         (video_files={} snapshot_files={} audio_files={})",
+                        result.frames_deleted,
+                        result.ocr_deleted,
+                        result.audio_transcriptions_deleted,
+                        result.ui_events_deleted,
+                        result.video_files.len(),
+                        result.snapshot_files.len(),
+                        result.audio_files.len(),
+                    );
+                }
+
+                total += batch_total;
+
+                for path in result
+                    .video_files
+                    .iter()
+                    .chain(result.audio_files.iter())
+                    .chain(result.snapshot_files.iter())
+                {
+                    if let Err(e) = tokio::fs::remove_file(path).await {
+                        warn!("retention: failed to delete file {}: {}", path, e);
+                    }
+                }
+            }
+            Err(e) => {
+                warn!(
+                    "retention: batch delete failed for range {} to {}: {}",
+                    batch_start, batch_end, e
+                );
+            }
+        }
+
+        batch_start = batch_end;
+
+        // Yield between batches so other writes can acquire the semaphore
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     }
 
-    // Delete media files from disk AFTER successful DB commit
-    for path in result
-        .video_files
-        .iter()
-        .chain(result.audio_files.iter())
-        .chain(result.snapshot_files.iter())
-    {
-        if let Err(e) = tokio::fs::remove_file(path).await {
-            warn!("retention: failed to delete file {}: {}", path, e);
+    // One-time orphan cleanup after all batches
+    if any_deleted {
+        if let Err(e) = db.cleanup_orphaned_chunks().await {
+            warn!("retention: orphan chunk cleanup failed: {}", e);
         }
     }
 

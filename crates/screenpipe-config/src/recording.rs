@@ -75,8 +75,8 @@ pub struct RecordingSettings {
     pub filter_music: bool,
 
     /// Maximum batch duration in seconds for batch transcription.
-    /// None = use engine-aware defaults (Deepgram=3600s, Whisper/OpenAI=600s).
-    /// Previously stored in SettingsStore.extra["batchMaxDurationSecs"].
+    /// None = use engine-aware defaults (Deepgram=5000s, OpenAI=3000s, Whisper=600s).
+    /// Also controls the max deferral cap during active meetings.
     #[serde(rename = "batchMaxDurationSecs", default)]
     pub batch_max_duration_secs: Option<u64>,
 
@@ -127,7 +127,7 @@ pub struct RecordingSettings {
     pub ignore_incognito_windows: bool,
 
     /// Pause all screen capture when a DRM streaming app (Netflix, etc.) is focused.
-    #[serde(rename = "pauseOnDrmContent", default)]
+    #[serde(rename = "pauseOnDrmContent", default = "default_true")]
     pub pause_on_drm_content: bool,
 
     /// Languages for transcription (ISO 639-1 codes).
@@ -164,6 +164,16 @@ pub struct RecordingSettings {
     /// Previously stored in SettingsStore.extra["openaiCompatibleModel"].
     #[serde(rename = "openaiCompatibleModel", default)]
     pub openai_compatible_model: Option<String>,
+
+    /// Custom HTTP headers for OpenAI-compatible transcription requests.
+    /// JSON object, e.g. {"X-Custom-Header": "value"}.
+    #[serde(rename = "openaiCompatibleHeaders", default)]
+    pub openai_compatible_headers: Option<std::collections::HashMap<String, String>>,
+
+    /// Send raw WAV audio instead of MP3 to OpenAI-compatible endpoint.
+    /// Some ASR providers prefer uncompressed audio for better accuracy.
+    #[serde(rename = "openaiCompatibleRawAudio", default)]
+    pub openai_compatible_raw_audio: bool,
 
     // ── System ─────────────────────────────────────────────────────────
     /// HTTP server port for the screenpipe API.
@@ -242,7 +252,7 @@ impl Default for RecordingSettings {
             included_windows: vec![],
             ignored_urls: vec![],
             ignore_incognito_windows: true,
-            pause_on_drm_content: false,
+            pause_on_drm_content: true,
             languages: vec![],
             use_pii_removal: false,
             user_id: String::new(),
@@ -250,6 +260,8 @@ impl Default for RecordingSettings {
             openai_compatible_endpoint: None,
             openai_compatible_api_key: None,
             openai_compatible_model: None,
+            openai_compatible_headers: None,
+            openai_compatible_raw_audio: false,
             port: 3030,
             power_mode: None,
             use_chinese_mirror: false,
@@ -259,6 +271,10 @@ impl Default for RecordingSettings {
             enable_accessibility: true,
         }
     }
+}
+
+fn default_true() -> bool {
+    true
 }
 
 fn default_fps() -> f32 {
