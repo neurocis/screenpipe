@@ -108,9 +108,12 @@ export type Settings = SettingsStore & {
 	dictationDevice?: string;
 	/** When true, audio devices follow system default and auto-switch on changes */
 	useSystemDefaultAudio?: boolean;
-	adaptiveFps?: boolean;
+	/** @deprecated Always true — kept for serde compat */
 	enableInputCapture?: boolean;
+	/** @deprecated Always true — kept for serde compat */
 	enableAccessibility?: boolean;
+	/** Enable AI workflow event detection (cloud, triggers event-based pipes) */
+	enableWorkflowEvents?: boolean;
 	/** Audio transcription scheduling: "realtime" (default) or "batch" (longer chunks for quality) */
 	transcriptionMode?: "realtime" | "smart" | "batch";
 	/** User's name for speaker identification — input device audio will be labeled with this name */
@@ -161,6 +164,8 @@ export type Settings = SettingsStore & {
 	localRetentionEnabled?: boolean;
 	/** Days to keep data locally before auto-deleting (default: 30) */
 	localRetentionDays?: number;
+	/** Apply macOS vibrancy effect to sidebar for a translucent glass look */
+	translucentSidebar?: boolean;
 	/** Notification preferences — which notification sources are enabled */
 	notificationPrefs?: {
 		captureStalls: boolean;
@@ -169,6 +174,20 @@ export type Settings = SettingsStore & {
 		pipeNotifications: boolean;
 		mutedPipes: string[];
 	};
+	/** Remote devices to monitor pipes on (LAN addresses) */
+	monitorDevices?: Array<{
+		address: string;
+		label?: string;
+	}>;
+	/** Enable recording schedule — when on, recording only runs during defined time ranges */
+	scheduleEnabled?: boolean;
+	/** Per-day-of-week time ranges defining when recording is active */
+	scheduleRules?: Array<{
+		dayOfWeek: number;
+		startTime: string;
+		endTime: string;
+		recordMode: string;
+	}>;
 }
 
 export function getEffectiveFilters(settings: Settings) {
@@ -181,7 +200,7 @@ export function getEffectiveFilters(settings: Settings) {
 }
 
 export const DEFAULT_PROMPT = `Rules:
-- Videos: use inline code \`/path/to/video.mp4\` (not links or multiline blocks)
+- Media: use standard markdown ![description](/path/to/file.mp4) for videos and ![description](/path/to/image.jpg) for images
 - Diagrams: use \`\`\`mermaid blocks for visual summaries (flowchart, gantt, mindmap, graph)
 - Activity summaries: gantt charts with apps/duration
 - Workflows: flowcharts showing steps taken
@@ -224,28 +243,26 @@ const DEFAULT_IGNORED_WINDOWS_PER_OS: Record<string, string[]> = {
 };
 
 // Default Screenpipe Cloud preset
-const DEFAULT_PI_PRESET: AIPreset = {
-	id: "pi-agent",
+const DEFAULT_CLOUD_PRESET: AIPreset = {
+	id: "screenpipe-cloud",
 	provider: "screenpipe-cloud",
 	url: "",
-	model: "qwen/qwen3.5-flash-02-23",
+	model: "auto",
 	maxContextChars: 1000000,
 	defaultPreset: true,
 	prompt: "",
 };
 
-// Legacy presets removed — Pi agent is the only default now
-// screenpipe-cloud presets are migrated away for existing users
-
+// Legacy presets removed — screenpipe-cloud is the only default now
 let DEFAULT_SETTINGS: Settings = {
-			aiPresets: [DEFAULT_PI_PRESET as any],
+			aiPresets: [DEFAULT_CLOUD_PRESET as any],
 			deviceId: crypto.randomUUID(),
 			deepgramApiKey: "",
 			isLoading: false,
 			userId: "",
 			analyticsId: "",
 			devMode: false,
-			audioTranscriptionEngine: "whisper-large-v3-turbo",
+			audioTranscriptionEngine: "whisper-large-v3-turbo-quantized",
 			ocrEngine: "default",
 			monitorIds: ["default"],
 			audioDevices: ["default"],
@@ -260,7 +277,6 @@ let DEFAULT_SETTINGS: Settings = {
 			ignoredUrls: [],
 			teamFilters: { ignoredWindows: [], includedWindows: [], ignoredUrls: [] },
 
-			fps: 0.5,
 			vadSensitivity: "medium",
 			analyticsEnabled: true,
 			audioChunkDuration: 30,
@@ -307,14 +323,13 @@ let DEFAULT_SETTINGS: Settings = {
 			disableVision: false,
 			disableOcr: false,
 			useAllMonitors: true,
-			adaptiveFps: false,
 			showShortcutOverlay: true,
 			chatHistory: {
 				conversations: [],
 				activeConversationId: null,
 				historyEnabled: true,
 			},
-			enableInputCapture: false,
+			enableInputCapture: true,
 			enableAccessibility: true,
 			overlayMode: "fullscreen",
 			showOverlayInScreenRecording: false,
@@ -336,7 +351,6 @@ export function createDefaultSettingsObject(): Settings {
 		DEFAULT_SETTINGS.ignoredWindows = [...DEFAULT_IGNORED_WINDOWS_IN_ALL_OS];
 		DEFAULT_SETTINGS.ignoredWindows.push(...(DEFAULT_IGNORED_WINDOWS_PER_OS[p] ?? []));
 		DEFAULT_SETTINGS.ocrEngine = p === "macos" ? "apple-native" : p === "windows" ? "windows-native" : "tesseract";
-		DEFAULT_SETTINGS.fps = p === "macos" ? 0.5 : 1;
 		DEFAULT_SETTINGS.showScreenpipeShortcut = p === "windows" ? "Alt+S" : "Control+Super+S";
 		DEFAULT_SETTINGS.showChatShortcut = p === "windows" ? "Alt+L" : "Control+Super+L";
 		DEFAULT_SETTINGS.searchShortcut = p === "windows" ? "Alt+K" : "Control+Super+K";
@@ -346,8 +360,6 @@ export function createDefaultSettingsObject(): Settings {
 		DEFAULT_SETTINGS.dictationShortcut = p === "windows" ? "Alt+D" : "Control+Super+D";
 
 		if (p === "windows") {
-			DEFAULT_SETTINGS.enableAccessibility = true;
-			DEFAULT_SETTINGS.enableInputCapture = true;
 			DEFAULT_SETTINGS.disableOcr = true;
 			DEFAULT_SETTINGS.overlayMode = "window";
 		}
@@ -405,7 +417,7 @@ function createSettingsStore() {
 
 		// Migration: Add default presets if user has none
 		if (!settings.aiPresets || settings.aiPresets.length === 0) {
-			settings.aiPresets = [DEFAULT_PI_PRESET as any];
+			settings.aiPresets = [DEFAULT_CLOUD_PRESET as any];
 			needsUpdate = true;
 		}
 
@@ -417,15 +429,23 @@ function createSettingsStore() {
 			needsUpdate = true;
 		}
 
-		// Migration: Add screenpipe-cloud preset for existing users and make it default
+		// Migration: Rename "pi-agent" preset id to "screenpipe-cloud"
+		if (settings.aiPresets?.some((p: any) => p.id === "pi-agent")) {
+			settings.aiPresets = settings.aiPresets.map((p: any) =>
+				p.id === "pi-agent" ? { ...p, id: "screenpipe-cloud" } : p
+			);
+			needsUpdate = true;
+		}
+
+		// Migration: Add screenpipe-cloud preset for existing users (without touching their existing presets)
 		const hasCloudPreset = settings.aiPresets?.some(
-			(p: any) => p.id === "pi-agent" || p.provider === "screenpipe-cloud"
+			(p: any) => p.id === "screenpipe-cloud" || p.provider === "screenpipe-cloud"
 		);
 		if (settings.aiPresets && settings.aiPresets.length > 0 && !hasCloudPreset) {
-			// Demote all existing presets from default
-			settings.aiPresets = settings.aiPresets.map((p: any) => ({ ...p, defaultPreset: false }));
-			// Add screenpipe-cloud as default at the front
-			settings.aiPresets = [DEFAULT_PI_PRESET as any, ...settings.aiPresets];
+			// Only set as default if no other preset is already default
+			const hasDefault = settings.aiPresets.some((p: any) => p.defaultPreset);
+			const cloudPreset = { ...DEFAULT_CLOUD_PRESET, defaultPreset: !hasDefault };
+			settings.aiPresets = [cloudPreset as any, ...settings.aiPresets];
 			needsUpdate = true;
 		}
 
@@ -477,24 +497,27 @@ function createSettingsStore() {
 		}
 
 		// Migration: Auto-detect hardware and adjust engine for weak machines (one-time only)
-		if (!(settings as any)._hardwareCapabilityMigrationDone) {
-			try {
-				const { commands: tauriCommands } = await import("../utils/tauri");
-				const hw = await tauriCommands.getHardwareCapability();
-				if (hw.isWeakForLargeModel) {
-					const currentEngine = settings.audioTranscriptionEngine;
-					if (currentEngine.includes("large")) {
-						// Weak hardware with a large model: downgrade to recommended
-						settings.audioTranscriptionEngine = hw.recommendedEngine;
-						needsUpdate = true;
-					}
+		// Migration: Switch to Parakeet as default engine (one-time)
+		// - Paid cloud subscribers → screenpipe-cloud (better accuracy)
+		// - macOS users → whisper-large-v3-turbo-quantized (parakeet/MLX is experimental on macOS)
+		// - Windows/Linux users → parakeet (stable on these platforms)
+		if (!(settings as any)._parakeetDefaultMigrationDone) {
+			const engine = settings.audioTranscriptionEngine;
+			const isWhisperVariant = engine?.includes("whisper");
+			if (isWhisperVariant || engine === "screenpipe-cloud" || engine === "parakeet") {
+				if (settings.user?.cloud_subscribed) {
+					settings.audioTranscriptionEngine = "screenpipe-cloud";
+				} else {
+					const { platform: getPlatform } = await import("@tauri-apps/plugin-os");
+					const os = getPlatform();
+					settings.audioTranscriptionEngine = os === "macos"
+						? "whisper-large-v3-turbo-quantized"
+						: "parakeet";
 				}
-				// Only mark done on success — if backend wasn't ready, retry next load
-				(settings as any)._hardwareCapabilityMigrationDone = true;
 				needsUpdate = true;
-			} catch {
-				// Backend not ready (e.g. during SSR) — skip, will retry next settings load
 			}
+			(settings as any)._parakeetDefaultMigrationDone = true;
+			needsUpdate = true;
 		}
 
 		// Save migrations if needed

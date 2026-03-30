@@ -76,9 +76,9 @@ async fn list_connections(State(state): State<ConnectionsState>) -> Json<Value> 
             .await
             .unwrap_or(false);
         arr.push(json!({
-            "id": "calendar",
-            "name": "Calendar",
-            "icon": "calendar",
+            "id": "apple-calendar",
+            "name": "Apple Calendar",
+            "icon": "apple-calendar",
             "category": "productivity",
             "description": format!(
                 "Read-only access to your native {} calendar. \
@@ -163,6 +163,68 @@ async fn test_connection(
             StatusCode::OK,
             Json(json!({ "success": true, "message": msg })),
         ),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": e.to_string() })),
+        ),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Multi-instance routes
+// ---------------------------------------------------------------------------
+
+/// GET /connections/:id/instances — list all saved instances for an integration.
+async fn list_instances(
+    State(state): State<ConnectionsState>,
+    Path(id): Path<String>,
+) -> (StatusCode, Json<Value>) {
+    let mgr = state.cm.lock().await;
+    match mgr.get_all_instances(&id) {
+        Ok(instances) => {
+            let items: Vec<Value> = instances
+                .into_iter()
+                .map(|(inst, conn)| {
+                    json!({
+                        "instance": inst,
+                        "enabled": conn.enabled,
+                        "credentials": conn.credentials,
+                    })
+                })
+                .collect();
+            (StatusCode::OK, Json(json!({ "instances": items })))
+        }
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": e.to_string() })),
+        ),
+    }
+}
+
+/// PUT /connections/:id/instances/:instance — save credentials for a named instance.
+async fn connect_instance(
+    State(state): State<ConnectionsState>,
+    Path((id, instance)): Path<(String, String)>,
+    Json(body): Json<ConnectRequest>,
+) -> (StatusCode, Json<Value>) {
+    let mgr = state.cm.lock().await;
+    match mgr.connect_instance(&id, Some(&instance), body.credentials) {
+        Ok(()) => (StatusCode::OK, Json(json!({ "success": true }))),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": e.to_string() })),
+        ),
+    }
+}
+
+/// DELETE /connections/:id/instances/:instance — disconnect a named instance.
+async fn disconnect_instance_route(
+    State(state): State<ConnectionsState>,
+    Path((id, instance)): Path<(String, String)>,
+) -> (StatusCode, Json<Value>) {
+    let mgr = state.cm.lock().await;
+    match mgr.disconnect_instance(&id, Some(&instance)) {
+        Ok(()) => (StatusCode::OK, Json(json!({ "success": true }))),
         Err(e) => (
             StatusCode::BAD_REQUEST,
             Json(json!({ "error": e.to_string() })),
@@ -328,6 +390,12 @@ where
         .route("/whatsapp/pair", post(whatsapp_pair))
         .route("/whatsapp/status", get(whatsapp_status))
         .route("/whatsapp/disconnect", post(whatsapp_disconnect))
+        // Multi-instance routes (must be before /:id to avoid conflict)
+        .route("/:id/instances", get(list_instances))
+        .route(
+            "/:id/instances/:instance",
+            axum::routing::put(connect_instance).delete(disconnect_instance_route),
+        )
         // Generic integration routes
         .route(
             "/:id",

@@ -106,19 +106,42 @@ pub fn is_enterprise_build_cmd(app_handle: tauri::AppHandle) -> bool {
     is_enterprise_build(&app_handle)
 }
 
-/// Read the enterprise license key from `enterprise.json` next to the executable.
-/// Admins push this file via Intune/MDM to a protected directory (e.g. Program Files)
-/// that employees cannot modify. Returns None if the file doesn't exist or is invalid.
+/// Read the enterprise license key from `enterprise.json`.
+/// Checks in order:
+/// 1. Next to executable (pushed via Intune/MDM to Program Files / .app bundle)
+/// 2. `~/.screenpipe/enterprise.json` (entered manually by employee via in-app prompt)
+/// Returns None if no file is found or is invalid.
 #[tauri::command]
 #[specta::specta]
 pub fn get_enterprise_license_key() -> Option<String> {
-    let exe = std::env::current_exe().ok()?;
+    // Try MDM-deployed location first (next to executable)
+    if let Some(key) = read_enterprise_key_from_exe_dir() {
+        return Some(key);
+    }
+
+    // Fallback: ~/.screenpipe/enterprise.json (manually entered by employee)
+    let user_path = screenpipe_core::paths::default_screenpipe_data_dir().join("enterprise.json");
+    if user_path.exists() {
+        info!("enterprise: checking user config at {}", user_path.display());
+        return read_enterprise_key_from_path(&user_path);
+    }
+
+    info!("enterprise: no enterprise.json found in any location");
+    None
+}
+
+fn read_enterprise_key_from_exe_dir() -> Option<String> {
+    let exe = match std::env::current_exe() {
+        Ok(e) => e,
+        Err(e) => {
+            warn!("enterprise: failed to get current_exe: {}", e);
+            return None;
+        }
+    };
     let exe_dir = exe.parent()?;
 
-    // Check next to executable first (Program Files on Windows, .app/Contents/MacOS on macOS)
     let config_path = exe_dir.join("enterprise.json");
 
-    // On macOS, also check the Resources directory inside the .app bundle
     #[cfg(target_os = "macos")]
     let config_path = if config_path.exists() {
         config_path
@@ -127,15 +150,58 @@ pub fn get_enterprise_license_key() -> Option<String> {
     };
 
     if !config_path.exists() {
+        info!("enterprise: no enterprise.json at {}", config_path.display());
         return None;
     }
 
-    let contents = std::fs::read_to_string(&config_path).ok()?;
-    let parsed: serde_json::Value = serde_json::from_str(&contents).ok()?;
-    parsed
+    read_enterprise_key_from_path(&config_path)
+}
+
+fn read_enterprise_key_from_path(path: &std::path::Path) -> Option<String> {
+    info!("enterprise: found enterprise.json at {}", path.display());
+
+    let contents = match std::fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(e) => {
+            error!("enterprise: failed to read {}: {}", path.display(), e);
+            return None;
+        }
+    };
+    let parsed: serde_json::Value = match serde_json::from_str(&contents) {
+        Ok(v) => v,
+        Err(e) => {
+            error!("enterprise: failed to parse enterprise.json: {}", e);
+            return None;
+        }
+    };
+    let key = parsed
         .get("license_key")
         .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
+        .map(|s| s.to_string());
+
+    match &key {
+        Some(k) => info!("enterprise: license key loaded ({}...)", &k[..k.len().min(8)]),
+        None => warn!("enterprise: enterprise.json missing 'license_key' field"),
+    }
+
+    key
+}
+
+/// Save the enterprise license key to `~/.screenpipe/enterprise.json`.
+/// Used by the in-app prompt when enterprise.json is not deployed via MDM.
+#[tauri::command]
+#[specta::specta]
+pub fn save_enterprise_license_key(license_key: String) -> Result<(), String> {
+    let dir = screenpipe_core::paths::default_screenpipe_data_dir();
+    std::fs::create_dir_all(&dir).map_err(|e| format!("failed to create dir: {}", e))?;
+
+    let path = dir.join("enterprise.json");
+    let json = serde_json::json!({ "license_key": license_key });
+    std::fs::write(&path, serde_json::to_string_pretty(&json).unwrap())
+        .map_err(|e| format!("failed to write {}: {}", path.display(), e))?;
+
+    info!("enterprise: license key saved to {}", path.display());
+    Ok(())
 }
 
 #[tauri::command]
@@ -421,6 +487,7 @@ pub async fn open_pipe_window(
     .focused(true)
     .fullscreen(false)
     .build()
+    .map(crate::window::finalize_webview_window)
     {
         Ok(window) => window,
         Err(e) => {
@@ -553,6 +620,7 @@ pub async fn open_login_window(app_handle: tauri::AppHandle) -> Result<(), Strin
             }
         })
         .build()
+        .map(crate::window::finalize_webview_window)
         .map_err(|e| e.to_string())?;
 
         Ok(())
@@ -603,6 +671,7 @@ pub async fn open_google_calendar_auth_window(
         }
     })
     .build()
+    .map(crate::window::finalize_webview_window)
     .map_err(|e| e.to_string())?;
 
     Ok(())
@@ -1065,6 +1134,7 @@ pub async fn show_shortcut_reminder(
 
     let window = builder
         .build()
+        .map(crate::window::finalize_webview_window)
         .map_err(|e| format!("Failed to create shortcut reminder window: {}", e))?;
 
     info!("shortcut-reminder window created");
@@ -1218,8 +1288,8 @@ pub async fn show_notification_panel(
         }
     }
 
-    let window_width = 320.0;
-    let window_height = 180.0;
+    let window_width = 340.0;
+    let window_height = 380.0;
 
     // Position at top-right of the screen where the cursor is
     let (x, y) = {
@@ -1263,6 +1333,12 @@ pub async fn show_notification_panel(
         }
     };
 
+    // Parse autoDismissMs from payload for the server-side safety timeout
+    let auto_dismiss_ms: u64 = serde_json::from_str::<serde_json::Value>(&payload)
+        .ok()
+        .and_then(|v| v.get("autoDismissMs")?.as_u64())
+        .unwrap_or(20000);
+
     // If window exists, reposition to current screen and show
     if let Some(window) = app_handle.get_webview_window(label) {
         info!("notification-panel window exists, repositioning and showing");
@@ -1300,6 +1376,21 @@ pub async fn show_notification_panel(
                 }
             });
         }
+
+        // Server-side safety timeout: force-hide the notification if the JS
+        // auto-dismiss timer fails (e.g. webview timer throttled on Windows).
+        // Adds 5s buffer so JS normally handles it first.
+        let app_safety = app_handle.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(auto_dismiss_ms + 5000)).await;
+            if let Some(w) = app_safety.get_webview_window("notification-panel") {
+                if w.is_visible().unwrap_or(false) {
+                    info!("Safety timeout: force-hiding notification panel");
+                    let _ = w.hide();
+                }
+            }
+        });
+
         return Ok(());
     }
 
@@ -1325,6 +1416,7 @@ pub async fn show_notification_panel(
 
     let window = builder
         .build()
+        .map(crate::window::finalize_webview_window)
         .map_err(|e| format!("Failed to create notification panel window: {}", e))?;
 
     info!("notification-panel window created");
@@ -1394,6 +1486,19 @@ pub async fn show_notification_panel(
             "notification-panel-update",
             &payload_clone,
         );
+    });
+
+    // Server-side safety timeout for newly created windows too
+    let app_safety = app_handle.clone();
+    tokio::spawn(async move {
+        // 2s wait for mount + autoDismissMs + 5s buffer
+        tokio::time::sleep(std::time::Duration::from_millis(auto_dismiss_ms + 7000)).await;
+        if let Some(w) = app_safety.get_webview_window("notification-panel") {
+            if w.is_visible().unwrap_or(false) {
+                info!("Safety timeout: force-hiding notification panel (new window)");
+                let _ = w.hide();
+            }
+        }
     });
 
     Ok(())
@@ -1638,4 +1743,188 @@ pub async fn copy_text_to_clipboard(text: String) -> Result<(), String> {
         .set_text(text)
         .map_err(|e| format!("failed to set clipboard: {}", e))?;
     Ok(())
+}
+
+#[tauri::command]
+#[specta::specta]
+pub fn set_native_theme(app_handle: tauri::AppHandle, theme: String) -> Result<(), String> {
+    info!("setting native theme to: {}", theme);
+    let tauri_theme = match theme.as_str() {
+        "light" => Some(tauri::Theme::Light),
+        "dark" => Some(tauri::Theme::Dark),
+        _ => None,
+    };
+
+    for window in app_handle.webview_windows().values() {
+        let _ = window.set_theme(tauri_theme);
+    }
+
+    Ok(())
+}
+
+#[derive(serde::Serialize, specta::Type)]
+pub struct CacheFile {
+    pub path: String,
+    pub label: String,
+    pub size_bytes: u64,
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn list_cache_files() -> Result<Vec<CacheFile>, String> {
+    let data_dir = screenpipe_core::paths::default_screenpipe_data_dir();
+    let home_dir = dirs::home_dir().ok_or("no home directory")?;
+    let mut files = Vec::new();
+
+    // Pi agent node_modules (~/.screenpipe/pi-agent/)
+    let pi_agent = data_dir.join("pi-agent");
+    if pi_agent.exists() {
+        let size = dir_size(&pi_agent);
+        files.push(CacheFile {
+            path: pi_agent.to_string_lossy().to_string(),
+            label: "AI agent cache (pi-agent)".to_string(),
+            size_bytes: size,
+        });
+    }
+
+    // Pi config (~/.pi/agent/)
+    let pi_config = home_dir.join(".pi").join("agent");
+    if pi_config.exists() {
+        let size = dir_size(&pi_config);
+        files.push(CacheFile {
+            path: pi_config.to_string_lossy().to_string(),
+            label: "AI agent config (.pi/agent)".to_string(),
+            size_bytes: size,
+        });
+    }
+
+    // Stale root-level node_modules (~/.screenpipe/node_modules/)
+    let root_nm = data_dir.join("node_modules");
+    if root_nm.exists() {
+        let size = dir_size(&root_nm);
+        files.push(CacheFile {
+            path: root_nm.to_string_lossy().to_string(),
+            label: "Legacy node_modules".to_string(),
+            size_bytes: size,
+        });
+    }
+
+    // DB crash recovery/backup files
+    for entry in std::fs::read_dir(&data_dir).map_err(|e| e.to_string())? {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        let name = entry.file_name().to_string_lossy().to_string();
+        let path = entry.path();
+
+        // *.corrupt*, *.backup files
+        if name.contains(".corrupt") || name.ends_with(".backup") {
+            let size = if path.is_dir() {
+                dir_size(&path)
+            } else {
+                path.metadata().map(|m| m.len()).unwrap_or(0)
+            };
+            files.push(CacheFile {
+                path: path.to_string_lossy().to_string(),
+                label: format!("DB recovery artifact: {}", name),
+                size_bytes: size,
+            });
+        }
+
+        // db-recovery-* and db-hotfix-* directories
+        if path.is_dir() && (name.starts_with("db-recovery-") || name.starts_with("db-hotfix-")) {
+            let size = dir_size(&path);
+            files.push(CacheFile {
+                path: path.to_string_lossy().to_string(),
+                label: format!("DB recovery artifact: {}", name),
+                size_bytes: size,
+            });
+        }
+
+        // Old log files (screenpipe.*.log — legacy CLI format)
+        if name.starts_with("screenpipe.") && name.ends_with(".log") {
+            let size = path.metadata().map(|m| m.len()).unwrap_or(0);
+            files.push(CacheFile {
+                path: path.to_string_lossy().to_string(),
+                label: format!("Old log: {}", name),
+                size_bytes: size,
+            });
+        }
+
+        // Empty/stale DB files (data.db, screenpipe.db, store.sqlite)
+        if matches!(name.as_str(), "data.db" | "screenpipe.db" | "store.sqlite") {
+            let size = path.metadata().map(|m| m.len()).unwrap_or(0);
+            if size == 0 {
+                files.push(CacheFile {
+                    path: path.to_string_lossy().to_string(),
+                    label: format!("Empty DB: {}", name),
+                    size_bytes: size,
+                });
+            }
+        }
+    }
+
+    // Stale root-level bun artifacts
+    for name in &["bun.lock", "bun.lockb", "package.json"] {
+        let path = data_dir.join(name);
+        if path.exists() {
+            let size = path.metadata().map(|m| m.len()).unwrap_or(0);
+            files.push(CacheFile {
+                path: path.to_string_lossy().to_string(),
+                label: format!("Stale config: {}", name),
+                size_bytes: size,
+            });
+        }
+    }
+
+    Ok(files)
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn delete_cache_files(paths: Vec<String>) -> Result<u64, String> {
+    let mut freed = 0u64;
+    for p in &paths {
+        let path = std::path::Path::new(p);
+        if !path.exists() {
+            continue;
+        }
+        let size = if path.is_dir() {
+            dir_size(path)
+        } else {
+            path.metadata().map(|m| m.len()).unwrap_or(0)
+        };
+        let result = if path.is_dir() {
+            std::fs::remove_dir_all(path)
+        } else {
+            std::fs::remove_file(path)
+        };
+        match result {
+            Ok(_) => {
+                info!("cache cleanup: deleted {}", p);
+                freed += size;
+            }
+            Err(e) => warn!("cache cleanup: failed to delete {}: {}", p, e),
+        }
+    }
+    Ok(freed)
+}
+
+fn dir_size(path: &std::path::Path) -> u64 {
+    let mut total = 0u64;
+    let mut stack = vec![path.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        if let Ok(entries) = std::fs::read_dir(&dir) {
+            for entry in entries.flatten() {
+                let p = entry.path();
+                if p.is_dir() {
+                    stack.push(p);
+                } else {
+                    total += p.metadata().map(|m| m.len()).unwrap_or(0);
+                }
+            }
+        }
+    }
+    total
 }

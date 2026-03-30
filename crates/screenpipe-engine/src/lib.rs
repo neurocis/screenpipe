@@ -20,6 +20,7 @@ pub mod pipes_api;
 pub mod recording_config;
 pub mod retention;
 pub mod routes;
+pub mod schedule_monitor;
 
 pub mod event_driven_capture;
 pub mod hot_frame_cache;
@@ -39,6 +40,7 @@ mod video;
 pub mod video_cache;
 pub mod video_utils;
 pub mod vision_manager;
+pub mod workflow_classifier;
 pub use auto_destruct::watch_pid;
 pub use axum::Json as JsonResponse;
 pub use cli::Cli;

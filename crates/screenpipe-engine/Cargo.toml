@@ -118,6 +118,11 @@ dashmap = { workspace = true }
 # Heap profiling (opt-in via --features heap-prof)
 dhat = { version = "0.3", optional = true }
 
+# jemalloc — aggressively returns freed pages to OS, reducing RSS bloat from fragmentation.
+# Default allocator on macOS/Linux. Not used on Windows (unsupported).
+[target.'cfg(not(target_os = "windows"))'.dependencies]
+tikv-jemallocator = { version = "0.6", optional = true }
+
 [dev-dependencies]
 env_logger = "0.10"
 tempfile = "3.3.0"
@@ -128,15 +133,19 @@ tower = { version = "0.4", features = ["util"] }
 criterion = { workspace = true }
 
 [features]
-default = ["qwen3-asr"]
+default = ["qwen3-asr", "parakeet"]
 metal = ["screenpipe-audio/metal"]
 heap-prof = ["dhat"]
 cuda = ["screenpipe-audio/cuda"]
+directml = ["screenpipe-audio/directml"]
 vulkan = ["screenpipe-audio/vulkan"]
 debug-console = ["console-subscriber"]
 pulseaudio = ["screenpipe-audio/pulseaudio"]
 apple-intelligence = ["dep:screenpipe-apple-intelligence"]
 qwen3-asr = ["screenpipe-audio/qwen3-asr"]
+parakeet = ["screenpipe-audio/parakeet"]
+parakeet-mlx = ["screenpipe-audio/parakeet-mlx"]
+jemalloc = ["tikv-jemallocator"]
 
 [[bin]]
 name = "screenpipe"
@@ -159,5 +168,5 @@ windows = { version = "0.58", features = [
 socket2 = "0.5"
 
 [target.'cfg(target_os = "macos")'.dependencies]
-cidre = { git = "https://github.com/yury/cidre.git", features = ["ax", "ns"] }
+cidre = { git = "https://github.com/yury/cidre.git", features = ["ax", "ns", "av", "blocks"] }
 tracing-oslog = { workspace = true }

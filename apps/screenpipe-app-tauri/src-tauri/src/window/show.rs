@@ -14,6 +14,8 @@ use tracing::{debug, error, info};
 use crate::store::{OnboardingStore, SettingsStore};
 
 #[cfg(target_os = "macos")]
+use super::content_process::setup_content_process_handler;
+#[cfg(target_os = "macos")]
 use super::first_responder::{make_nswindow_webview_first_responder, make_webview_first_responder};
 #[cfg(target_os = "macos")]
 use super::focus::{restore_frontmost_app, restore_frontmost_app_if_external_with_app};
@@ -185,6 +187,16 @@ impl ShowRewindWindow {
             builder = builder.decorations(true);
         }
 
+        // Apply theme from settings
+        if let Ok(Some(settings)) = SettingsStore::get(app) {
+            let tauri_theme = match settings.ui_theme.as_str() {
+                "light" => Some(tauri::Theme::Light),
+                "dark" => Some(tauri::Theme::Dark),
+                _ => None, // "system" or others
+            };
+            builder = builder.theme(tauri_theme);
+        }
+
         builder
     }
 
@@ -223,6 +235,11 @@ impl ShowRewindWindow {
         overlay_mode: &str,
         label: &str,
     ) -> tauri::Result<WebviewWindow> {
+        #[cfg(target_os = "macos")]
+        // Ensure delegate-level recovery is installed for already-created main windows.
+        // This catches WKWebView content-process termination directly from WebKit.
+        setup_content_process_handler(window);
+
         let capturable = crate::config::is_e2e_mode()
             || SettingsStore::get(app)
                 .unwrap_or_default()
@@ -342,12 +359,25 @@ impl ShowRewindWindow {
             #[cfg(target_os = "windows")]
             {
                 window.show().ok();
-                // Overlay mode: bring to front WITHOUT stealing focus.
-                // Using bring_to_front (SWP_NOACTIVATE) instead of
-                // bring_to_front_and_activate (SetForegroundWindow) prevents
-                // the overlay from yanking focus away from fullscreen games.
-                if let Err(e) = crate::windows_overlay::bring_to_front(window) {
-                    error!("Failed to bring window to front: {}", e);
+                // Reposition overlay to the monitor where the cursor is,
+                // matching macOS behavior where the panel moves to the active screen.
+                if let Ok(cursor) = app.cursor_position() {
+                    if let Err(e) = crate::windows_overlay::reposition_to_cursor_monitor(
+                        window,
+                        cursor.x as i32,
+                        cursor.y as i32,
+                    ) {
+                        error!("Failed to reposition overlay to cursor monitor: {}", e);
+                        // Fallback: just bring to front at current position
+                        if let Err(e) = crate::windows_overlay::bring_to_front(window) {
+                            error!("Failed to bring window to front: {}", e);
+                        }
+                    }
+                } else {
+                    // Can't get cursor position, just bring to front
+                    if let Err(e) = crate::windows_overlay::bring_to_front(window) {
+                        error!("Failed to bring window to front: {}", e);
+                    }
                 }
                 let _ = app.emit("window-focused", true);
             }
@@ -403,6 +433,9 @@ impl ShowRewindWindow {
             *MAIN_CREATED_MODE.lock().unwrap_or_else(|e| e.into_inner()) = overlay_mode.clone();
         // === Other windows: standard show path ===
         } else if let Some(window) = id.get(app) {
+            #[cfg(target_os = "macos")]
+            setup_content_process_handler(&window);
+
             if id.label() == RewindWindowId::Onboarding.label() {
                 if onboarding_store.is_completed {
                     return ShowRewindWindow::Main.show(app);
@@ -1015,11 +1048,11 @@ impl ShowRewindWindow {
                                 // Setup Win32 overlay AFTER webview loads so the
                                 // window becomes visible only when JS is ready
                                 // to handle keyboard events.
-                                if let Err(e) = crate::windows_overlay::setup_overlay(win, false) {
+                                if let Err(e) = crate::windows_overlay::setup_overlay(&win, false) {
                                     tracing::error!("Failed to setup Windows overlay: {}", e);
                                 }
                                 // Activate so keyboard focus goes to the webview
-                                if let Err(e) = crate::windows_overlay::bring_to_front_and_activate(win) {
+                                if let Err(e) = crate::windows_overlay::bring_to_front_and_activate(&win) {
                                     tracing::error!("Failed to activate overlay: {}", e);
                                 }
                                 let _ = app_clone.emit("window-focused", true);
@@ -1250,9 +1283,22 @@ impl ShowRewindWindow {
                     Some(p) => format!("/home?section={}", p),
                     None => "/home".to_string(),
                 };
+
                 let builder = self.window_builder(app, &url).focused(true);
                 #[cfg(target_os = "macos")]
-                let builder = builder.hidden_title(true);
+                let builder = {
+                    use tauri::window::Color;
+                    use tauri::TitleBarStyle;
+                    builder
+                        .title_bar_style(TitleBarStyle::Overlay)
+                        .hidden_title(true)
+                        .background_color(Color(0, 0, 0, 1))
+                        .effects(tauri::utils::config::WindowEffectsConfig {
+                            effects: vec![tauri::window::Effect::Menu],
+                            state: Some(tauri::window::EffectState::Active),
+                            ..Default::default()
+                        })
+                };
                 let window = builder.build()?;
 
                 // Disable WKWebView's native scroll so wheel events reach JavaScript
@@ -1599,6 +1645,9 @@ impl ShowRewindWindow {
                 window
             }
         };
+
+        #[cfg(target_os = "macos")]
+        setup_content_process_handler(&window);
 
         Ok(window)
     }

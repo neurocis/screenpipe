@@ -19,29 +19,58 @@ import { AIProvider } from './base';
 import { Message, RequestBody, ResponseFormat } from '../types';
 import { VertexAIProvider } from './vertex';
 
-// Vertex MaaS model IDs — model names without publisher prefix, all on global endpoint
+const MAX_RETRIES = 3;
+const BASE_DELAY_MS = 1000;
+
+async function fetchWithRetry(url: string, init: RequestInit, label: string): Promise<Response> {
+	let lastError: Error | null = null;
+	for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
+		const response = await fetch(url, init);
+		if (response.status !== 429) return response;
+
+		lastError = new Error(`429 on attempt ${attempt + 1}`);
+		const retryAfter = response.headers.get('retry-after');
+		const delayMs = retryAfter
+			? Math.min(parseInt(retryAfter, 10) * 1000, 10000)
+			: BASE_DELAY_MS * Math.pow(2, attempt) + Math.random() * 500;
+		console.warn(`${label}: 429 rate limited, retrying in ${Math.round(delayMs)}ms (attempt ${attempt + 1}/${MAX_RETRIES})`);
+		await new Promise((r) => setTimeout(r, delayMs));
+	}
+	// Final attempt — return whatever we get
+	return fetch(url, init);
+}
+
+// Vertex MaaS model IDs — short name → Vertex publisher/model ID + region
 const VERTEX_MAAS_MODELS: Record<string, { vertexId: string; region: string }> = {
-	'glm-4.7': { vertexId: 'zhipuai/glm-4.7-maas', region: 'global' },
-	'glm-5': { vertexId: 'zhipuai/glm-5-maas', region: 'global' },
+	'glm-4.7': { vertexId: 'zai-org/glm-4.7-maas', region: 'global' },
+	'glm-5': { vertexId: 'zai-org/glm-5-maas', region: 'global' },
 	'kimi-k2.5': { vertexId: 'moonshotai/kimi-k2-thinking-maas', region: 'global' },
+	'llama-4-maverick': { vertexId: 'meta/llama-4-maverick-17b-128e-instruct-maas', region: 'us-east5' },
+	'llama-4-scout': { vertexId: 'meta/llama-4-scout-17b-16e-instruct-maas', region: 'us-east5' },
 };
 
 export function isVertexMaasModel(model: string): boolean {
 	const lower = model.toLowerCase();
-	return Object.keys(VERTEX_MAAS_MODELS).some((key) => lower.includes(key));
+	// Exact match first (e.g. "llama-4-maverick"), then substring for legacy names.
+	// This prevents "meta-llama/llama-4-maverick" (OpenRouter) from matching.
+	return Object.keys(VERTEX_MAAS_MODELS).some((key) => lower === key) ||
+		['glm-', 'kimi-'].some((prefix) => lower.includes(prefix));
 }
 
 export function resolveVertexMaasModel(model: string): { vertexId: string; region: string } | null {
 	const lower = model.toLowerCase();
+	// Exact match first
+	if (VERTEX_MAAS_MODELS[lower]) return VERTEX_MAAS_MODELS[lower];
+	// Substring fallback for GLM/Kimi variants
 	for (const [key, value] of Object.entries(VERTEX_MAAS_MODELS)) {
-		if (lower.includes(key)) return value;
+		if (lower.includes(key) && !lower.includes('/')) return value;
 	}
 	return null;
 }
 
 export class VertexMaasProvider implements AIProvider {
 	supportsTools = true;
-	supportsVision = false;
+	supportsVision = true;
 	supportsJson = true;
 
 	private vertexProvider: VertexAIProvider;
@@ -76,14 +105,16 @@ export class VertexMaasProvider implements AIProvider {
 		if (body.tools) payload.tools = body.tools;
 		if (body.tool_choice) payload.tool_choice = body.tool_choice;
 
-		const response = await fetch(url, {
+		const fetchInit: RequestInit = {
 			method: 'POST',
 			headers: {
 				Authorization: `Bearer ${accessToken}`,
 				'Content-Type': 'application/json',
 			},
 			body: JSON.stringify(payload),
-		});
+		};
+
+		const response = await fetchWithRetry(url, fetchInit, `Vertex MaaS ${resolved.vertexId}`);
 
 		if (!response.ok) {
 			const error = await response.text();
@@ -114,14 +145,16 @@ export class VertexMaasProvider implements AIProvider {
 		if (body.tools) payload.tools = body.tools;
 		if (body.tool_choice) payload.tool_choice = body.tool_choice;
 
-		const response = await fetch(url, {
+		const fetchInit: RequestInit = {
 			method: 'POST',
 			headers: {
 				Authorization: `Bearer ${accessToken}`,
 				'Content-Type': 'application/json',
 			},
 			body: JSON.stringify(payload),
-		});
+		};
+
+		const response = await fetchWithRetry(url, fetchInit, `Vertex MaaS streaming ${resolved.vertexId}`);
 
 		if (!response.ok) {
 			const error = await response.text();
@@ -139,6 +172,19 @@ export class VertexMaasProvider implements AIProvider {
 			content: Array.isArray(msg.content)
 				? msg.content.map((part) => {
 						if (part.type === 'text') return { type: 'text', text: part.text || '' };
+						// OpenAI image_url format passthrough
+						if (part.type === 'image_url' && part.image_url?.url) {
+							return { type: 'image_url', image_url: { url: part.image_url.url } };
+						}
+						// Pi native format: { type: "image", data, mimeType }
+						if (part.type === 'image' && part.data && part.mimeType) {
+							return { type: 'image_url', image_url: { url: `data:${part.mimeType};base64,${part.data}` } };
+						}
+						// Anthropic base64 format
+						if (part.type === 'image' && part.source?.type === 'base64') {
+							const mt = part.source.media_type || part.source.mediaType || 'image/png';
+							return { type: 'image_url', image_url: { url: `data:${mt};base64,${part.source.data}` } };
+						}
 						return part;
 				  })
 				: msg.content,
@@ -157,6 +203,8 @@ export class VertexMaasProvider implements AIProvider {
 			{ id: 'glm-4.7', name: 'GLM-4.7 (best coding, 200K ctx)', provider: 'vertex-maas' },
 			{ id: 'glm-5', name: 'GLM-5 (top reasoning, 745B)', provider: 'vertex-maas' },
 			{ id: 'kimi-k2.5', name: 'Kimi K2.5 (strong all-rounder)', provider: 'vertex-maas' },
+			{ id: 'llama-4-maverick', name: 'Llama 4 Maverick (vision, 400B MoE)', provider: 'vertex-maas' },
+			{ id: 'llama-4-scout', name: 'Llama 4 Scout (vision, 109B MoE)', provider: 'vertex-maas' },
 		];
 	}
 }

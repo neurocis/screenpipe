@@ -116,9 +116,8 @@ interface OpenAIModel {
 }
 
 export const DEFAULT_PROMPT = `Rules:
-- You can analyze/view/show/access videos to the user by putting .mp4 files in a code block (we'll render it) like this: \`/users/video.mp4\`, use the exact, absolute, file path from file_path property
-- Do not try to embed video in links (e.g. [](.mp4) or https://.mp4) instead put the file_path in a code block using backticks
-- Do not put video in multiline code block it will not render the video (e.g. \`\`\`bash\n.mp4\`\`\` IS WRONG) instead using inline code block with single backtick
+- Media: use standard markdown ![description](/path/to/file.mp4) for videos and ![description](/path/to/image.jpg) for images
+- Use the exact absolute file_path from search results, do not modify it
 - Always answer my question/intent, do not make up things
 `;
 
@@ -504,7 +503,7 @@ export function AIProviderConfig({
                 ...formData,
                 provider: "openai-chatgpt",
                 url: "https://api.openai.com/v1",
-                model: "gpt-4o",
+                model: "gpt-5.4",
               });
             }}
           >
@@ -545,7 +544,7 @@ export function AIProviderConfig({
                   ...formData,
                   provider: "screenpipe-cloud",
                   url: "", // Pi uses RPC mode
-                  model: "claude-haiku-4-5",
+                  model: "auto",
                 });
               }}
             >
@@ -748,7 +747,7 @@ export function AIProviderConfig({
                 id="model"
                 type="text"
                 list="chatgpt-models"
-                placeholder="gpt-4o"
+                placeholder="gpt-5.4"
                 value={formData.model || ""}
                 onChange={(e) =>
                   setFormData({ ...formData, model: e.target.value })
@@ -1267,7 +1266,7 @@ export const AIPresetsSelector = ({
 
   const handleRemovePreset = (preset: AIPreset) => {
     if (!settings?.aiPresets) return;
-    // Prevent deletion of pi-agent preset for Pro subscribers (pi = screenpipe cloud)
+    // Prevent deletion of screenpipe-cloud preset for Pro subscribers
     if (preset.provider === "screenpipe-cloud" && settings.user?.cloud_subscribed) {
       toast.error("Cannot delete cloud preset", {
         description: "This preset is included with your Pro subscription",

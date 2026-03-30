@@ -10,7 +10,7 @@ import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
 import { useSettings, ChatMessage, ChatConversation } from "@/lib/hooks/use-settings";
 import { cn } from "@/lib/utils";
-import { Loader2, Send, Square, User, Settings, ExternalLink, X, ImageIcon, History, Search, Trash2, ChevronLeft, ChevronRight, ChevronDown, ChevronUp, Plus, Copy, Check, Clock, Paperclip, Filter } from "lucide-react";
+import { Loader2, Send, Square, User, Settings, ExternalLink, X, ImageIcon, History, Search, Trash2, ChevronLeft, ChevronRight, ChevronDown, ChevronUp, Plus, Copy, Check, Clock, Paperclip, Filter, RefreshCw } from "lucide-react";
 import { SchedulePromptDialog } from "@/components/chat/schedule-prompt-dialog";
 import { toast } from "@/components/ui/use-toast";
 import { motion, AnimatePresence } from "framer-motion";
@@ -51,7 +51,8 @@ import { DictationButton } from "@/components/dictation-indicator";
 import { useDictation } from "@/lib/hooks/use-dictation";
 
 const SCREENPIPE_API = "http://localhost:3030";
-const PI_CHAT_SESSION = "chat";
+// Session ID is per-conversation — set on mount (new conv) and updated on load/new.
+// Stored as a ref so event listeners always see the current value without stale closures.
 
 interface MentionSuggestion {
   tag: string;
@@ -155,9 +156,10 @@ EXAMPLES OF GOOD SEARCHES:
 - User: "what apps did I use today" → call activity-summary with start_time: today_start, end_time: now → report active_minutes per app
 - User: "what was I reading about X" → search q:"X", start_time:"3h ago" → show text with deep links
 
-Rules for showing videos/audio:
-- Show videos by putting .mp4 file paths in inline code blocks: \`/path/to/video.mp4\`
-- Use the exact, absolute file_path from search results
+Rules for showing media:
+- Show videos/images using standard markdown: ![description](/path/to/file.mp4) or ![description](/path/to/image.jpg)
+- ONLY use the exact, unmodified file_path or audio_file_path from search results. NEVER construct or guess paths.
+- Before showing a video, verify the file exists by checking it with the shell (e.g. ls or Test-Path). If missing, tell the user and retry search with a different time range instead of showing a broken player.
 
 SPEAKER MANAGEMENT (localhost:3030):
 - GET /speakers/unnamed?limit=10 — list unnamed speakers
@@ -177,7 +179,7 @@ When the user asks for diagrams, flowcharts, or visualizations, generate Mermaid
 DEEP LINKS & MEDIA:
 - Frame (PREFERRED): [10:30 AM — Chrome](screenpipe://frame/12345) — use frame_id from screen text search results. NEVER invent frame IDs.
 - Timeline (audio only): [meeting at 3pm](screenpipe://timeline?timestamp=2024-01-15T15:00:00Z) — use exact timestamp from audio search results.
-- Video: show .mp4 paths in inline code: \`/path/to/video.mp4\`
+- Video/Image: use markdown ![description](/path/to/file.mp4)
 NEVER fabricate frame IDs or timestamps — only use values from actual search results.
 
 Current time: ${now.toISOString()}
@@ -223,6 +225,7 @@ interface Message {
   contentBlocks?: ContentBlock[];
   model?: string;
   provider?: string;
+  retryPrompt?: string; // when set, renders a retry CTA on error messages
 }
 
 // Tool icons by name
@@ -760,8 +763,23 @@ function ToolCallGroup({ toolCalls }: { toolCalls: ToolCall[] }) {
 }
 
 // Renders message content with interleaved text and tool call blocks
-function MessageContent({ message, onImageClick }: { message: Message; onImageClick?: (images: string[], index: number) => void }) {
+function MessageContent({ message, onImageClick, onRetry }: { message: Message; onImageClick?: (images: string[], index: number) => void; onRetry?: (prompt: string) => void }) {
   const isUser = message.role === "user";
+
+  // Retry CTA — shown at the bottom of error messages that have a retryPrompt
+  const retryCta = !isUser && message.retryPrompt ? (
+    <div className="mt-3 pt-3 border-t border-border/40 flex items-center gap-3">
+      <button
+        type="button"
+        onClick={() => onRetry?.(message.retryPrompt!)}
+        className="flex items-center gap-1.5 text-xs font-medium px-3 py-1.5 rounded-lg bg-foreground text-background hover:bg-foreground/80 transition-colors"
+      >
+        <RefreshCw className="h-3 w-3" />
+        Try again
+      </button>
+      <span className="text-xs text-muted-foreground">or edit your message above</span>
+    </div>
+  ) : null;
 
   // If we have content blocks (Pi messages with tool calls), render them in order
   // Group consecutive tool blocks into collapsible containers
@@ -781,6 +799,7 @@ function MessageContent({ message, onImageClick }: { message: Message; onImageCl
           }
           return null;
         })}
+        {retryCta}
       </div>
     );
   }
@@ -816,6 +835,7 @@ function MessageContent({ message, onImageClick }: { message: Message; onImageCl
     <div className="space-y-2">
       {imageThumbs}
       <MarkdownBlock text={message.content} isUser={isUser} />
+      {retryCta}
     </div>
   );
 }
@@ -932,6 +952,7 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
   const piLastCrashRef = useRef(0);
   const piThinkingStartRef = useRef<number | null>(null);
   const piSessionSyncedRef = useRef(false);
+  const piSessionIdRef = useRef<string>(crypto.randomUUID());
   const piRunningConfigRef = useRef<{ provider: string; model: string; token: string | null } | null>(null);
 
   // Active pipe execution (when watching a running pipe)
@@ -1016,6 +1037,7 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
     piMessageIdRef,
     piContentBlocksRef,
     piSessionSyncedRef,
+    piSessionIdRef,
     setIsLoading,
     setIsStreaming,
     setPastedImages,
@@ -1171,58 +1193,37 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
         const fullMessage = `${context}\n\n${prompt}`;
         // Start a new conversation then send
         (async () => {
-          // Clear all streaming state so sendPiMessage doesn't think a message is in-flight
-          piStreamingTextRef.current = "";
-          piMessageIdRef.current = null;
-          piContentBlocksRef.current = [];
-          setIsLoading(false);
-          setIsStreaming(false);
-          setMessages([]);
-          setConversationId(null);
-          setPrefillContext(null);
-          setPrefillFrameId(null);
-          // Set input as fallback in case auto-send fails (pi not ready)
-          setInput(fullMessage);
-          // Wait for Pi to be ready before sending (poll up to 10s)
-          const waitForPi = async (maxMs: number): Promise<boolean> => {
-            const start = Date.now();
-            while (Date.now() - start < maxMs) {
-              try {
-                const info = await commands.piInfo(PI_CHAT_SESSION);
-                if (info.status === "ok" && info.data.running) {
-                  setPiInfo(info.data);
-                  return true;
-                }
-              } catch {}
-              await new Promise(r => setTimeout(r, 500));
-            }
-            return false;
-          };
-          const ready = piInfo?.running || await waitForPi(10000);
-          if (ready) {
-            // Reset Pi session AFTER confirming it's running to clear any
-            // stale isStreaming state from a previous conversation.
-            // This must happen here, not earlier — on fresh page loads
-            // (e.g. navigateHomeAndPrefill), piInfo is null at mount time
-            // so gating on piInfo?.running would skip this entirely.
-            try {
-              await commands.piNewSession(PI_CHAT_SESSION);
-            } catch (e) {
-              console.warn("[Pi] Failed to reset session before auto-send:", e);
-            }
-            // Signal that the next sendPiMessage call should bypass the piInfo guard
-            // (we just confirmed Pi is running via waitForPi but React state may be stale)
+          try {
+            // Clear all streaming state so sendPiMessage doesn't think a message is in-flight
+            piStreamingTextRef.current = "";
+            piMessageIdRef.current = null;
+            piContentBlocksRef.current = [];
+            setIsLoading(false);
+            setIsStreaming(false);
+            setMessages([]);
+            setConversationId(null);
+            setPrefillContext(null);
+            setPrefillFrameId(null);
+            // Set input as fallback in case auto-send fails
+            setInput(fullMessage);
+            // Assign a fresh session ID — this is a brand-new conversation.
+            // Without this, the prefill would send to the previous conversation's
+            // Pi process which still has old context baked in.
+            piSessionIdRef.current = crypto.randomUUID();
+            piSessionSyncedRef.current = true; // fresh session, no history to inject
+            // With multi-session, Pi starts fresh per conversation — sendPiMessage
+            // handles auto-starting it. Just bypass the canChat guard and send.
             autoSendBypassRef.current = true;
-            // Give React a tick to re-render with updated piInfo
             await new Promise(r => setTimeout(r, 200));
             if (sendMessageRef.current) {
               await sendMessageRef.current(fullMessage);
               setInput("");
               if (inputRef.current) inputRef.current.style.height = "auto";
             }
+          } finally {
             autoSendBypassRef.current = false;
+            prefillInFlightRef.current = false;
           }
-          prefillInFlightRef.current = false;
         })();
         return;
       }
@@ -1414,7 +1415,7 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
 
     const cursorPos = e.target.selectionStart || 0;
     const textBeforeCursor = value.slice(0, cursorPos);
-    const atMatch = textBeforeCursor.match(/@(\w*)$/);
+    const atMatch = textBeforeCursor.match(/@([\w-]*)$/);
 
     if (atMatch) {
       setShowMentionDropdown(true);
@@ -1517,16 +1518,27 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
     setTimeout(() => inputRef.current?.focus(), 100);
   }, []);
 
-  // Escape key to close window
+  // Escape key: abort agent if running, otherwise close window
   useEffect(() => {
-    const handleEscape = (e: KeyboardEvent) => {
+    const handleEscape = async (e: KeyboardEvent) => {
       if (e.key === "Escape" && !showMentionDropdown) {
-        commands.closeWindow("Chat");
+        if (isLoading || isStreaming) {
+          // Stop the agent
+          try {
+            await commands.piAbort(piSessionIdRef.current);
+          } catch (err) {
+            console.warn("[Pi] Failed to abort on Escape:", err);
+          }
+          setIsLoading(false);
+          setIsStreaming(false);
+        } else {
+          commands.closeWindow("Chat");
+        }
       }
     };
     window.addEventListener("keydown", handleEscape);
     return () => window.removeEventListener("keydown", handleEscape);
-  }, [showMentionDropdown]);
+  }, [showMentionDropdown, isLoading, isStreaming]);
 
   // Smart auto-scroll: only scroll to bottom if user is near the bottom.
   // If user scrolled up to read, don't interrupt them.
@@ -1600,7 +1612,7 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
   useEffect(() => {
     const checkPi = async () => {
       try {
-        const result = await commands.piInfo(PI_CHAT_SESSION);
+        const result = await commands.piInfo(piSessionIdRef.current);
         if (result.status === "ok") {
           setPiInfo(result.data);
         }
@@ -1612,7 +1624,7 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
     // Keep polling Pi status — recovers from stale termination events and transient failures
     const interval = setInterval(async () => {
       try {
-        const result = await commands.piInfo(PI_CHAT_SESSION);
+        const result = await commands.piInfo(piSessionIdRef.current);
         if (result.status === "ok") {
           setPiInfo(result.data);
         }
@@ -1639,6 +1651,7 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
     let unlistenPipeEvent: UnlistenFn | null = null;
     let unlistenTerminated: UnlistenFn | null = null;
     let unlistenLog: UnlistenFn | null = null;
+    let unlistenReauth: UnlistenFn | null = null;
     let mounted = true;
 
     // Shared handler for Pi event data — used by both pi_event and pipe_event
@@ -1994,7 +2007,7 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
               // Re-send the last prompt
               const lastUserMsg = messages.findLast(m => m.role === "user");
               if (lastUserMsg?.content) {
-                commands.piPrompt(PI_CHAT_SESSION, lastUserMsg.content, null).catch(() => {});
+                commands.piPrompt(piSessionIdRef.current, lastUserMsg.content, null).catch(() => {});
               }
             }
             return;
@@ -2025,6 +2038,24 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
             } else if (errorStr.includes("model_not_allowed")) {
                 setMessages((prev) =>
                 prev.map((m) => m.id === msgId ? { ...m, content: "This model requires an upgrade." } : m)
+              );
+            } else if (errorStr.includes("already processing")) {
+              console.warn("[Pi] already-processing race in response event:", errorStr);
+              setMessages((prev) =>
+                prev.map((m) => m.id === msgId ? {
+                  ...m,
+                  content: "The AI was mid-response when your message arrived.",
+                  retryPrompt: lastUserMessageRef.current || undefined,
+                } : m)
+              );
+            } else if (errorStr.includes("api_error") || errorStr.includes("Internal server error") || /\b5\d\d\b/.test(errorStr)) {
+              // Upstream API 5xx — SDK already exhausted its auto-retry attempts
+              setMessages((prev) =>
+                prev.map((m) => m.id === msgId ? {
+                  ...m,
+                  content: "Something went wrong on the server.",
+                  retryPrompt: lastUserMessageRef.current || undefined,
+                } : m)
               );
             } else {
               setMessages((prev) =>
@@ -2071,7 +2102,7 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
       unlistenEvent = await listen<any>("pi_event", (event) => {
         if (!mounted) return;
         const { sessionId, event: piEvent } = event.payload;
-        if (sessionId !== PI_CHAT_SESSION) return;
+        if (sessionId !== piSessionIdRef.current) return;
         handlePiEventData(piEvent);
       });
 
@@ -2090,22 +2121,24 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
       unlistenTerminated = await listen<any>("pi_terminated", (event) => {
         if (!mounted) return;
         const { sessionId, pid: terminatedPid } = event.payload;
-        if (sessionId !== PI_CHAT_SESSION) return;
+        if (sessionId !== piSessionIdRef.current) return;
         if (piStoppedIntentionallyRef.current) {
           piStoppedIntentionallyRef.current = false;
           return;
         }
         console.log("[Pi] Process terminated, pid:", terminatedPid);
 
-        // If a message was in flight, mark it as errored so the UI doesn't stay stuck
+        // If a message was in flight, append error to the message so the user
+        // knows the agent stopped unexpectedly (not just "completed").
         if (piMessageIdRef.current) {
           const msgId = piMessageIdRef.current;
           setMessages((prev) =>
-            prev.map((m) =>
-              m.id === msgId && (m.content === "Processing..." || !m.content)
-                ? { ...m, content: "AI agent crashed — restarting automatically..." }
-                : m
-            )
+            prev.map((m) => {
+              if (m.id !== msgId) return m;
+              const existing = m.content && m.content !== "Processing..." ? m.content : "";
+              const errorSuffix = "\n\n---\n\n⚠️ agent stopped unexpectedly — restarting automatically...";
+              return { ...m, content: existing + errorSuffix };
+            })
           );
           piStreamingTextRef.current = "";
           piMessageIdRef.current = null;
@@ -2140,7 +2173,7 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
           if (!mounted) return;
           // Check if a newer Pi process is already running (race: stop → start → terminated)
           try {
-            const result = await commands.piInfo(PI_CHAT_SESSION);
+            const result = await commands.piInfo(piSessionIdRef.current);
             if (result.status === "ok" && result.data.running && result.data.pid !== terminatedPid) {
               console.log("[Pi] Stale termination for pid", terminatedPid, "— newer pid", result.data.pid, "is running");
               setPiInfo(result.data);
@@ -2154,7 +2187,7 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
               const providerConfig = buildProviderConfig();
               const home = await homeDir();
               const dir = await join(home, ".screenpipe", "pi-chat");
-              const result = await commands.piStart(PI_CHAT_SESSION, dir, settings.user?.token ?? null, providerConfig);
+              const result = await commands.piStart(piSessionIdRef.current, dir, settings.user?.token ?? null, providerConfig);
               if (result.status === "ok") {
                 setPiInfo(result.data);
                 piSessionSyncedRef.current = false;
@@ -2214,16 +2247,33 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
 
     setup();
 
+    // Restart the current session when a new auth token arrives (deeplink login).
+    listen<{ apiKey: string }>("pi-reauth", async (event) => {
+      if (!mounted) return;
+      try {
+        const home = await homeDir();
+        const dir = await join(home, ".screenpipe", "pi-chat");
+        const result = await commands.piStart(piSessionIdRef.current, dir, event.payload.apiKey, buildProviderConfig());
+        if (result.status === "ok") {
+          setPiInfo(result.data);
+          piSessionSyncedRef.current = false;
+        }
+      } catch (e) {
+        console.warn("[Pi] reauth restart skipped:", e);
+      }
+    }).then(fn => { unlistenReauth = fn; });
+
     return () => {
       mounted = false;
       unlistenEvent?.();
       unlistenPipeEvent?.();
       unlistenTerminated?.();
       unlistenLog?.();
+      unlistenReauth?.();
       // Abort any in-flight Pi request when navigating away from chat.
       // Without this, Pi keeps streaming in the background and rejects
       // new messages with "already processing" when the user returns.
-      commands.piAbort(PI_CHAT_SESSION).catch(() => {});
+      commands.piAbort(piSessionIdRef.current).catch(() => {});
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -2451,38 +2501,47 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
 
   // Send message using Pi agent
   async function sendPiMessage(userMessage: string, displayLabel?: string) {
-    // Auto-start Pi if it's dead (singleton recovery)
-    if (!piInfo?.running && !autoSendBypassRef.current) {
+    // Auto-start Pi if it's not running yet (new session or crash recovery)
+    if (!piInfo?.running) {
       if (piStartInFlightRef.current) {
-        toast({ title: "Pi starting", description: "Please wait a moment", variant: "destructive" });
-        return;
-      }
-      console.log("[Pi] Not running, auto-starting before sending message");
-      piStartInFlightRef.current = true;
-      setPiStarting(true);
-      try {
-        const providerConfig = buildProviderConfig();
-        const home = await homeDir();
-        const dir = await join(home, ".screenpipe", "pi-chat");
-        const result = await commands.piStart(PI_CHAT_SESSION, dir, settings.user?.token ?? null, providerConfig);
-        if (result.status === "ok" && result.data.running) {
-          setPiInfo(result.data);
-          piSessionSyncedRef.current = false;
-          piCrashCountRef.current = 0; // reset crash loop counter on manual start
-          // Keep running-config ref in sync so preset watcher doesn't re-trigger
-          if (providerConfig) {
-            piRunningConfigRef.current = { provider: providerConfig.provider, model: providerConfig.model, token: settings.user?.token ?? null };
-          }
-        } else {
-          toast({ title: "Failed to start Screenpipe Cloud", description: result.status === "error" ? result.error : "Unknown error", variant: "destructive" });
+        if (!autoSendBypassRef.current) {
+          toast({ title: "Pi starting", description: "Please wait a moment", variant: "destructive" });
           return;
         }
-      } catch (e) {
-        toast({ title: "Failed to start Screenpipe Cloud", description: String(e), variant: "destructive" });
-        return;
-      } finally {
-        setPiStarting(false);
-        piStartInFlightRef.current = false;
+        // Prefill auto-send: wait for in-flight start to complete
+        const startWait = Date.now();
+        while (piStartInFlightRef.current && Date.now() - startWait < 10000) {
+          await new Promise(r => setTimeout(r, 300));
+        }
+        if (piStartInFlightRef.current) return; // timed out
+      } else {
+        console.log("[Pi] Not running, auto-starting before sending message");
+        piStartInFlightRef.current = true;
+        setPiStarting(true);
+        try {
+          const providerConfig = buildProviderConfig();
+          const home = await homeDir();
+          const dir = await join(home, ".screenpipe", "pi-chat");
+          const result = await commands.piStart(piSessionIdRef.current, dir, settings.user?.token ?? null, providerConfig);
+          if (result.status === "ok" && result.data.running) {
+            setPiInfo(result.data);
+            piSessionSyncedRef.current = false;
+            piCrashCountRef.current = 0; // reset crash loop counter on manual start
+            // Keep running-config ref in sync so preset watcher doesn't re-trigger
+            if (providerConfig) {
+              piRunningConfigRef.current = { provider: providerConfig.provider, model: providerConfig.model, token: settings.user?.token ?? null };
+            }
+          } else {
+            toast({ title: "Failed to start Screenpipe Cloud", description: result.status === "error" ? result.error : "Unknown error", variant: "destructive" });
+            return;
+          }
+        } catch (e) {
+          toast({ title: "Failed to start Screenpipe Cloud", description: String(e), variant: "destructive" });
+          return;
+        } finally {
+          setPiStarting(false);
+          piStartInFlightRef.current = false;
+        }
       }
     }
 
@@ -2491,7 +2550,7 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
     if (piMessageIdRef.current) {
       console.warn("[Pi] Aborting previous message before sending new one");
       try {
-        await commands.piAbort(PI_CHAT_SESSION);
+        await commands.piAbort(piSessionIdRef.current);
       } catch (e) {
         console.warn("[Pi] Failed to abort previous:", e);
       }
@@ -2602,7 +2661,25 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
       if (!piSessionSyncedRef.current && messages.length > 0) {
         const historyLines = messages
           .slice(-40)
-          .map(m => `${m.role}: ${m.content}`)
+          .map(m => {
+            let text = m.content || "";
+            // Include contentBlocks info (tool calls, results) for richer context
+            if (m.contentBlocks?.length) {
+              const blockTexts = m.contentBlocks.map((b: any) => {
+                if (b.type === "text" && b.text) return b.text;
+                if (b.type === "tool" && b.toolCall) {
+                  const tc = b.toolCall;
+                  let s = `[tool: ${tc.toolName}](${JSON.stringify(tc.args)})`;
+                  if (tc.result) s += ` → ${tc.result.slice(0, 500)}`;
+                  return s;
+                }
+                return "";
+              }).filter(Boolean).join("\n");
+              if (blockTexts && !text) text = blockTexts;
+              else if (blockTexts) text += "\n" + blockTexts;
+            }
+            return `${m.role}: ${text}`;
+          })
           .join("\n");
         promptMessage = `<conversation_history>\n${historyLines}\n</conversation_history>\n\n${userMessage}`;
         piSessionSyncedRef.current = true;
@@ -2612,7 +2689,7 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
 
       // Send prompt — abort/new_session now await completion, so no retry needed
       const result = await commands.piPrompt(
-        PI_CHAT_SESSION,
+        piSessionIdRef.current,
         promptMessage,
         piImages.length > 0 ? piImages : null,
       );
@@ -2621,23 +2698,28 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
         if (timeoutId) clearTimeout(timeoutId);
         piMessageIdRef.current = null;
         // Provide helpful error messages for common failures
-        let errorMsg = result.error;
-        if (errorMsg.includes("already processing")) {
-          errorMsg = "AI is busy — please wait a moment and try again.";
-        } else if (errorMsg.includes("Broken pipe") || errorMsg.includes("not running") || errorMsg.includes("has died")) {
+        const rawError = result.error;
+        let errorMsg: string;
+        let retryPrompt: string | undefined;
+
+        if (rawError.includes("already processing")) {
+          errorMsg = "The AI was mid-response when your message arrived.";
+          retryPrompt = userMessage;
+        } else if (rawError.includes("Broken pipe") || rawError.includes("not running") || rawError.includes("has died")) {
           const provider = activePreset?.provider;
-          if (provider === "native-ollama") {
-            errorMsg = "Ollama is not running. Start it with: `ollama serve`";
-          } else {
-            errorMsg = "AI agent crashed — restarting automatically...";
-          }
-        } else if (errorMsg.includes("not found")) {
+          errorMsg = provider === "native-ollama"
+            ? "Ollama is not running. Start it with: `ollama serve`"
+            : "AI agent crashed — restarting automatically...";
+        } else if (rawError.includes("not found")) {
           errorMsg = `Model "${activePreset?.model}" not found. Check your AI preset in settings.`;
+        } else {
+          errorMsg = rawError;
+          retryPrompt = userMessage;
         }
         setMessages((prev) =>
           prev.map((m) =>
             m.id === assistantMessageId
-              ? { ...m, content: `Error: ${errorMsg}` }
+              ? { ...m, content: errorMsg, ...(retryPrompt ? { retryPrompt } : {}) }
               : m
           )
         );
@@ -2798,7 +2880,7 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
 
   const handleStop = async () => {
     try {
-      await commands.piAbort(PI_CHAT_SESSION);
+      await commands.piAbort(piSessionIdRef.current);
     } catch (e) {
       console.warn("[Pi] Failed to abort:", e);
     }
@@ -2847,6 +2929,7 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
         <Button
           variant={showHistory ? "secondary" : "ghost"}
           size="sm"
+          onMouseDown={(e) => e.stopPropagation()}
           onClick={async (e) => {
             e.stopPropagation();
             if (!showHistory) {
@@ -2855,7 +2938,7 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
             }
             setShowHistory(!showHistory);
           }}
-          className="h-7 px-2 gap-1 text-xs"
+          className="relative z-10 h-7 px-2 gap-1 text-xs"
           title="Chat history"
         >
           <History size={14} />
@@ -2864,13 +2947,14 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
         <Button
           variant="default"
           size="sm"
+          onMouseDown={(e) => e.stopPropagation()}
           onClick={async (e) => {
             e.stopPropagation();
             piStoppedIntentionallyRef.current = true;
             await startNewConversation();
             // Pi will auto-restart on the next message via the sendPiMessage flow
           }}
-          className="h-7 px-3 gap-1.5 text-xs bg-foreground text-background hover:bg-background hover:text-foreground transition-colors duration-150"
+          className="relative z-10 h-7 px-3 gap-1.5 text-xs bg-foreground text-background hover:bg-background hover:text-foreground transition-colors duration-150"
           title="New chat"
         >
           <Plus size={14} />
@@ -3113,7 +3197,7 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
                     : "bg-muted/30 border-border/50"
                 )}
               >
-                <MessageContent message={message} onImageClick={(images, index) => setImageViewer({ images, index })} />
+                <MessageContent message={message} onImageClick={(images, index) => setImageViewer({ images, index })} onRetry={(prompt) => sendMessage(prompt)} />
               </div>
                 {/* Action buttons - appear on hover, outside the message box */}
                 <div className="flex items-center gap-0.5 self-end mt-1 opacity-0 group-hover/message:opacity-100 transition-all duration-200">
@@ -3353,7 +3437,8 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
                 key={i}
                 type="button"
                 onClick={() => sendMessage(s.text)}
-                className="px-2.5 py-1 text-[11px] bg-muted/20 hover:bg-muted/50 rounded-full border border-border/20 hover:border-border/50 text-muted-foreground hover:text-foreground transition-colors cursor-pointer"
+                className="px-2.5 py-1 text-[11px] bg-muted/20 hover:bg-muted/50 rounded-full border border-border/20 hover:border-border/50 text-muted-foreground hover:text-foreground transition-colors cursor-pointer max-w-[280px] truncate"
+                title={s.text}
               >
                 {s.text}
               </button>

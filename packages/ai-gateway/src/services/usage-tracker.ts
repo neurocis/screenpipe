@@ -112,6 +112,8 @@ async function getCreditBalance(env: Env, userId: string): Promise<number> {
 
 // Per-model query weights — expensive models cost more daily queries
 const MODEL_WEIGHTS: Record<string, number> = {
+  // Auto — smart routing, free
+  'auto': 0,
   // Vertex MaaS — free for users (GCP credits), weight=0 so they don't eat daily quota
   'glm-4.7': 0,
   'glm-5': 0,
@@ -125,7 +127,7 @@ const MODEL_WEIGHTS: Record<string, number> = {
   'gemini-3-flash': 0,
   'gemini-2.5-flash': 0,
   // OpenRouter models
-  'qwen3.5-flash': 1,
+  'qwen3.5-flash': 0,
   'qwen3.5-397b': 3,
   'deepseek-chat': 1,
   'deepseek-v3.2-speciale': 3,
@@ -158,6 +160,7 @@ const DEFAULT_TIER_CONFIG: Record<UserTier, TierLimits> = {
     dailyQueries: 25,
     rpm: 15,
     allowedModels: [
+      'auto',
       'claude-haiku-4-5',
       'gemini-3-flash',
       'glm-4.7',
@@ -172,6 +175,7 @@ const DEFAULT_TIER_CONFIG: Record<UserTier, TierLimits> = {
     dailyQueries: 50,
     rpm: 25,
     allowedModels: [
+      'auto',
       'claude-haiku-4-5',
       'claude-sonnet-4-5',
       'gemini-3-flash',
@@ -311,7 +315,8 @@ export async function trackUsage(
         dailyCount = weight;
       } else {
         // Check limit BEFORE incrementing — don't inflate counter on rejected requests
-        if (existing.daily_count >= limits.dailyQueries) {
+        // Skip limit check for free models (weight=0) — they never count toward quota
+        if (weight > 0 && existing.daily_count >= limits.dailyQueries) {
           // Daily free quota exhausted — try credit fallback
           if (userId) {
             const credit = await tryDeductCredit(env, userId, 'ai_query');

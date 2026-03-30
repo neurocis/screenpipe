@@ -154,6 +154,38 @@ pub async fn run_pipe_now(
         None
     };
 
+    // Validate required connections are configured before running the pipe
+    if let Some(pipe_status) = mgr.get_pipe(&id).await {
+        let required = &pipe_status.config.connections;
+        if !required.is_empty() {
+            let screenpipe_dir = mgr
+                .pipes_dir()
+                .parent()
+                .unwrap_or(mgr.pipes_dir())
+                .to_path_buf();
+            let store = screenpipe_connect::connections::load_store(&screenpipe_dir);
+            let missing: Vec<&str> = required
+                .iter()
+                .filter(|conn_id| {
+                    !store
+                        .get(conn_id.as_str())
+                        .map(|c| c.enabled && !c.credentials.is_empty())
+                        .unwrap_or(false)
+                })
+                .map(|s| s.as_str())
+                .collect();
+            if !missing.is_empty() {
+                return Json(json!({
+                    "error": format!(
+                        "pipe '{}' requires unconfigured connections: {} — set them up in Settings → Connections",
+                        id,
+                        missing.join(", ")
+                    )
+                }));
+            }
+        }
+    }
+
     let result = mgr.start_pipe_background(&id).await;
 
     // Restore previous extra context
@@ -198,6 +230,48 @@ pub async fn get_pipe_executions(
     match mgr.get_executions(&id, limit).await {
         Ok(executions) => Json(json!({ "data": executions })),
         Err(e) => Json(json!({ "error": e.to_string() })),
+    }
+}
+
+/// GET /pipes/:id/session/:exec_id — read Pi session file for an execution.
+pub async fn get_pipe_session(
+    State(pm): State<SharedPipeManager>,
+    Path((id, exec_id)): Path<(String, i64)>,
+) -> (StatusCode, Json<Value>) {
+    let mgr = pm.lock().await;
+    let execs = match mgr.get_executions(&id, 100).await {
+        Ok(e) => e,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": e.to_string() })),
+            )
+        }
+    };
+    let exec = match execs.iter().find(|e| e.id == exec_id) {
+        Some(e) => e,
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({ "error": "execution not found" })),
+            )
+        }
+    };
+    let session_path = match &exec.session_path {
+        Some(p) => p.clone(),
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({ "error": "no session file for this execution" })),
+            )
+        }
+    };
+    match tokio::fs::read_to_string(&session_path).await {
+        Ok(content) => (StatusCode::OK, Json(json!({ "data": content }))),
+        Err(e) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": format!("failed to read session file: {}", e) })),
+        ),
     }
 }
 

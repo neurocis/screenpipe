@@ -41,9 +41,24 @@ pub enum CliAudioTranscriptionEngine {
     OpenAICompatible,
     #[clap(name = "qwen3-asr")]
     Qwen3Asr,
+    #[clap(name = "parakeet")]
+    Parakeet,
     /// Disable transcription (audio capture only, no speech-to-text)
     #[clap(name = "disabled")]
     Disabled,
+}
+
+/// Default audio engine based on hardware tier.
+///
+/// - Low tier (≤8GB): WhisperTiny (parakeet-mlx would OOM)
+/// - Mid/High tier: Parakeet (auto-upgrades to MLX GPU when compiled in)
+fn default_audio_engine() -> CliAudioTranscriptionEngine {
+    let tier = screenpipe_config::detect_tier();
+    if matches!(tier, screenpipe_config::DeviceTier::Low) {
+        CliAudioTranscriptionEngine::WhisperTiny
+    } else {
+        CliAudioTranscriptionEngine::Parakeet
+    }
 }
 
 fn cli_engine_to_str(engine: &CliAudioTranscriptionEngine) -> &'static str {
@@ -59,6 +74,7 @@ fn cli_engine_to_str(engine: &CliAudioTranscriptionEngine) -> &'static str {
         }
         CliAudioTranscriptionEngine::OpenAICompatible => "openai-compatible",
         CliAudioTranscriptionEngine::Qwen3Asr => "qwen3-asr",
+        CliAudioTranscriptionEngine::Parakeet => "parakeet",
         CliAudioTranscriptionEngine::Disabled => "disabled",
     }
 }
@@ -87,6 +103,7 @@ impl From<CliAudioTranscriptionEngine> for CoreAudioTranscriptionEngine {
                 CoreAudioTranscriptionEngine::OpenAICompatible
             }
             CliAudioTranscriptionEngine::Qwen3Asr => CoreAudioTranscriptionEngine::Qwen3Asr,
+            CliAudioTranscriptionEngine::Parakeet => CoreAudioTranscriptionEngine::Parakeet,
             CliAudioTranscriptionEngine::Disabled => CoreAudioTranscriptionEngine::Disabled,
         }
     }
@@ -94,10 +111,10 @@ impl From<CliAudioTranscriptionEngine> for CoreAudioTranscriptionEngine {
 
 #[derive(Clone, Debug, ValueEnum, PartialEq)]
 pub enum CliTranscriptionMode {
-    /// Transcribe immediately as audio is captured (default)
+    /// Transcribe immediately as audio is captured
     #[clap(name = "realtime")]
     Realtime,
-    /// Accumulate longer audio batches for better transcription quality
+    /// Accumulate longer audio batches for better transcription quality (default)
     #[clap(name = "batch", alias = "smart")]
     Batch,
 }
@@ -244,7 +261,7 @@ pub struct RecordArgs {
     pub debug: bool,
 
     /// Audio transcription engine to use
-    #[arg(short = 'a', long, value_enum, default_value_t = CliAudioTranscriptionEngine::WhisperLargeV3TurboQuantized)]
+    #[arg(short = 'a', long, value_enum, default_value_t = default_audio_engine())]
     pub audio_transcription_engine: CliAudioTranscriptionEngine,
 
     /// Monitor IDs to use
@@ -291,8 +308,8 @@ pub struct RecordArgs {
     #[arg(long, hide = true)]
     pub auto_destruct_pid: Option<u32>,
 
-    /// Audio transcription scheduling mode: realtime (default) or batch (longer chunks for quality)
-    #[arg(long, value_enum, default_value_t = CliTranscriptionMode::Realtime)]
+    /// Audio transcription scheduling mode: batch (default, longer chunks for quality) or realtime
+    #[arg(long, value_enum, default_value_t = CliTranscriptionMode::Batch)]
     pub transcription_mode: CliTranscriptionMode,
 
     /// Disable telemetry
@@ -363,7 +380,9 @@ impl RecordArgs {
             disable_vision: self.disable_vision,
             use_pii_removal: self.use_pii_removal,
             filter_music: self.filter_music,
+            #[allow(deprecated)]
             enable_input_capture: true,
+            #[allow(deprecated)]
             enable_accessibility: true,
             audio_transcription_engine: engine_str.to_string(),
             transcription_mode: mode_str.to_string(),
@@ -388,11 +407,58 @@ impl RecordArgs {
     }
 
     /// Convert RecordArgs into a unified RecordingConfig via RecordingSettings.
+    ///
+    /// If no `device_tier` is set in the config file, detects hardware and applies
+    /// tier-appropriate defaults (first-launch behavior for CLI users).
     pub fn into_recording_config(
         self,
         data_dir: PathBuf,
     ) -> crate::recording_config::RecordingConfig {
-        let settings = self.to_recording_settings();
+        let mut settings = self.to_recording_settings();
+
+        // First-launch tier detection for CLI users
+        if settings.device_tier.is_none() {
+            let config_path = data_dir.join("config.toml");
+            let existing = screenpipe_config::load_toml(&config_path).ok();
+            let has_tier = existing
+                .as_ref()
+                .map(|s| s.device_tier.is_some())
+                .unwrap_or(false);
+
+            if has_tier {
+                // Existing config with tier — just use it
+                if let Some(existing) = existing {
+                    settings.device_tier = existing.device_tier;
+                }
+            } else {
+                let tier = screenpipe_config::detect_tier();
+                eprintln!("detected hardware tier: {:?}", tier);
+                // Only apply capture defaults (video_quality, power_mode) for truly fresh installs.
+                // Existing config without tier = upgrade — just set the tier for DB/channel tuning.
+                let is_fresh = !config_path.exists();
+                if is_fresh {
+                    screenpipe_config::apply_tier_defaults(&mut settings, tier);
+                }
+                settings.device_tier = Some(tier.as_str().to_string());
+            }
+        }
+
+        // Safety guard: downgrade engine if unsafe for this platform
+        // (Low tier = OOM, macOS < 26 = parakeet-mlx segfault)
+        let tier = settings
+            .device_tier
+            .as_deref()
+            .and_then(screenpipe_config::DeviceTier::from_str_loose)
+            .unwrap_or_else(screenpipe_config::detect_tier);
+        if screenpipe_config::is_engine_unsafe(&settings.audio_transcription_engine, tier) {
+            let safe = screenpipe_config::best_engine_for_platform(tier);
+            eprintln!(
+                "warning: {} is not supported on this platform, using {} instead",
+                settings.audio_transcription_engine, safe
+            );
+            settings.audio_transcription_engine = safe.to_string();
+        }
+
         crate::recording_config::RecordingConfig::from_settings(&settings, data_dir, None)
     }
 }

@@ -193,16 +193,46 @@ async isEnterpriseBuildCmd() : Promise<boolean> {
     return await TAURI_INVOKE("is_enterprise_build_cmd");
 },
 /**
- * Read the enterprise license key from `enterprise.json` next to the executable.
- * Admins push this file via Intune/MDM to a protected directory (e.g. Program Files)
- * that employees cannot modify. Returns None if the file doesn't exist or is invalid.
+ * Read the enterprise license key from `enterprise.json`.
+ * Checks in order:
+ * 1. Next to executable (pushed via Intune/MDM to Program Files / .app bundle)
+ * 2. `~/.screenpipe/enterprise.json` (entered manually by employee via in-app prompt)
+ * Returns None if no file is found or is invalid.
  */
 async getEnterpriseLicenseKey() : Promise<string | null> {
     return await TAURI_INVOKE("get_enterprise_license_key");
 },
+/**
+ * Save the enterprise license key to `~/.screenpipe/enterprise.json`.
+ * Used by the in-app prompt when enterprise.json is not deployed via MDM.
+ */
+async saveEnterpriseLicenseKey(licenseKey: string) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("save_enterprise_license_key", { licenseKey }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
 async getDiskUsage(forceRefresh: boolean | null, dataDir: string | null) : Promise<Result<JsonValue, string>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("get_disk_usage", { forceRefresh, dataDir }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async listCacheFiles() : Promise<Result<CacheFile[], string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("list_cache_files") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async deleteCacheFiles(paths: string[]) : Promise<Result<bigint, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("delete_cache_files", { paths }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -925,6 +955,7 @@ export type AIPreset = { id: string; prompt: string; provider: AIProviderType; u
 export type AIProviderType = "openai" | "openai-chatgpt" | "native-ollama" | "custom" | "screenpipe-cloud" | "pi" | "anthropic"
 export type AudioDeviceInfo = { name: string; isDefault: boolean }
 export type BrowserLogEntry = { level: string; message: string }
+export type CacheFile = { path: string; label: string; size_bytes: bigint }
 export type CachedSuggestions = { suggestions: Suggestion[]; generatedAt: string; mode: string; aiGenerated: boolean; tags: string[] }
 export type CalendarEventItem = { id: string; title: string; 
 /**
@@ -952,7 +983,7 @@ export type CalendarStatus = { available: boolean; authorized: boolean; authoriz
 export type ChatGptOAuthStatus = { logged_in: boolean }
 export type Credits = { amount: number }
 export type EmbeddedLLM = { enabled: boolean; model: string; port: number }
-export type HardwareCapability = { hasGpu: boolean; cpuCores: bigint; totalMemoryGb: number; isWeakForLargeModel: boolean; recommendedEngine: string; reason: string }
+export type HardwareCapability = { hasGpu: boolean; cpuCores: bigint; totalMemoryGb: number; recommendedEngine: string; reason: string }
 export type IcsCalendarEntry = { name: string; url: string; enabled: boolean }
 export type JsonValue = null | boolean | number | string | JsonValue[] | { [key in string]: JsonValue }
 export type LogFile = { name: string; path: string; modified_at: bigint }
@@ -1001,6 +1032,26 @@ maxTokens?: number;
  */
 systemPrompt?: string | null }
 export type PipeSuggestionsSettings = { enabled: boolean; frequencyHours: number }
+/**
+ * A single schedule rule: a day-of-week + time range + what to record.
+ */
+export type ScheduleRule = { 
+/**
+ * Day of week: 0 = Monday, 6 = Sunday
+ */
+dayOfWeek: number; 
+/**
+ * Start time in "HH:MM" (24h format, local time)
+ */
+startTime: string; 
+/**
+ * End time in "HH:MM" (24h format, local time)
+ */
+endTime: string; 
+/**
+ * What to record: "all", "audio_only", "screen_only"
+ */
+recordMode: string }
 export type SettingsStore = 
 /**
  * All recording/capture config lives here. Flattened so the JSON shape
@@ -1051,8 +1102,8 @@ vadSensitivity: string;
 filterMusic: boolean; 
 /**
  * Maximum batch duration in seconds for batch transcription.
- * None = use engine-aware defaults (Deepgram=3600s, Whisper/OpenAI=600s).
- * Previously stored in SettingsStore.extra["batchMaxDurationSecs"].
+ * None = use engine-aware defaults (Deepgram=5000s, OpenAI=3000s, Whisper=600s).
+ * Also controls the max deferral cap during active meetings.
  */
 batchMaxDurationSecs?: bigint | null; 
 /**
@@ -1072,14 +1123,6 @@ monitorIds: string[];
  * Capture from all connected monitors.
  */
 useAllMonitors: boolean; 
-/**
- * Target frames per second for screen capture.
- */
-fps: number; 
-/**
- * Dynamically adjust FPS based on screen content changes.
- */
-adaptiveFps: boolean; 
 /**
  * Video quality preset: "low", "balanced", "high", "max".
  */
@@ -1170,13 +1213,35 @@ analyticsEnabled: boolean;
  */
 analyticsId: string; 
 /**
- * Enable input event capture (keyboard, mouse, clipboard).
+ * Legacy: input capture is always enabled. Kept for serde compat with
+ * existing store.bin files; deserialized but ignored.
+ * @deprecated input capture is always enabled; will be removed
  */
-enableInputCapture: boolean; 
+enableInputCapture?: boolean; 
 /**
- * Enable accessibility text capture (AX tree walker).
+ * Legacy: accessibility capture is always enabled. Kept for serde compat
+ * with existing store.bin files; deserialized but ignored.
+ * @deprecated accessibility capture is always enabled; will be removed
  */
-enableAccessibility: boolean }) & 
+enableAccessibility?: boolean; 
+/**
+ * Enable AI workflow event detection (cloud feature, requires subscription).
+ * When enabled, classifies desktop activity and triggers event-based pipes.
+ */
+enableWorkflowEvents?: boolean; 
+/**
+ * Detected hardware tier ("high", "mid", "low").
+ * Set once on first launch; `None` for existing installs (treated as High).
+ */
+deviceTier?: string | null; 
+/**
+ * Enable work-hours schedule (when false, records 24/7 as usual)
+ */
+scheduleEnabled?: boolean; 
+/**
+ * Per-day schedule rules (only used when schedule_enabled is true)
+ */
+scheduleRules?: ScheduleRule[] }) & 
 /**
  * Catch-all for fields added by the frontend (e.g. chatHistory)
  * that the Rust struct doesn't know about. Without this, `save()` would
@@ -1215,6 +1280,15 @@ chatAlwaysOnTop?: boolean;
  * Show restart notifications when audio/vision capture stalls.
  * Disabled by default for now until the stall detector is more reliable.
  */
+showRestartNotifications?: boolean; 
+/**
+ * When true, apply macOS vibrancy effect to the sidebar for a translucent look.
+ */
+translucentSidebar?: boolean; 
+/**
+ * UI theme: "light", "dark", or "system".
+ */
+uiTheme?: string;
 ignoreIncognitoWindows?: boolean }
 export type ShowRewindWindow = "Main" | { Home: { page: string | null } } | { Search: { query: string | null } } | "Onboarding" | "Chat" | "PermissionRecovery" | "Dictation"
 export type Suggestion = { text: string }

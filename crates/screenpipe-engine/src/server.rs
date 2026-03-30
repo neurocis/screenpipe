@@ -247,6 +247,11 @@ impl SCServer {
         let listener = bind_listener(self.addr).await?;
         info!("Server listening on {}", self.addr);
 
+        // Advertise via mDNS
+        if let Err(e) = screenpipe_connect::mdns::advertise(self.addr.port()) {
+            tracing::warn!("mdns advertisement failed (non-fatal): {}", e);
+        }
+
         // Start serving
         serve(
             listener,
@@ -647,6 +652,10 @@ impl SCServer {
                 .route(
                     "/:id/history",
                     axum::routing::delete(crate::pipes_api::clear_pipe_history),
+                )
+                .route(
+                    "/:id/session/:exec_id",
+                    axum::routing::get(crate::pipes_api::get_pipe_session),
                 )
                 // Store/registry routes (nested under /pipes/store)
                 .route(

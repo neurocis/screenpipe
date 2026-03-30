@@ -5,6 +5,7 @@
 "use client";
 
 import React, { useState, useEffect, useCallback, useRef, useMemo } from "react";
+// PipeMonitorView merged into PipesSection as device dropdown
 import { apiCache } from "@/lib/cache";
 import { Card, CardContent } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
@@ -44,6 +45,7 @@ import {
   Database,
   Image,
   Plug,
+  Accessibility,
   Clock,
   BadgeCheck,
   Upload,
@@ -60,7 +62,6 @@ import remarkGfm from "remark-gfm";
 import posthog from "posthog-js";
 import { PipesSection } from "@/components/settings/pipes-section";
 import { ChatPrefillData } from "@/lib/chat-utils";
-
 // --- Types ---
 
 interface StorePipe {
@@ -140,6 +141,7 @@ const PERMISSION_LABELS: { key: string; label: string; icon: React.ReactNode }[]
   { key: "raw_sql", label: "Raw SQL", icon: <Database className="h-3.5 w-3.5" /> },
   { key: "frames", label: "Screenshots", icon: <Image className="h-3.5 w-3.5" /> },
   { key: "connections", label: "Connections", icon: <Plug className="h-3.5 w-3.5" /> },
+  { key: "accessibility", label: "Accessibility", icon: <Accessibility className="h-3.5 w-3.5" /> },
 ];
 
 function getPermissionStatus(perms: PipePermissions | undefined, key: string): "allowed" | "denied" | "unset" {
@@ -227,14 +229,16 @@ function normalizePipe(raw: any): any {
 export function PipeStoreView() {
   const [activeTab, setActiveTab] = useState<"discover" | "my-pipes">("my-pipes");
 
+  const tabs = [
+    { key: "my-pipes" as const, label: "My Pipes" },
+    { key: "discover" as const, label: "Discover" },
+  ];
+
   return (
     <div className="space-y-0">
       {/* Tab bar */}
       <div className="flex items-center gap-6 border-b border-border pb-0 mb-6">
-        {([
-          { key: "my-pipes" as const, label: "My Pipes" },
-          { key: "discover" as const, label: "Discover" },
-        ]).map(({ key, label }) => (
+        {tabs.map(({ key, label }) => (
           <button
             key={key}
             onClick={() => setActiveTab(key)}
@@ -252,7 +256,7 @@ export function PipeStoreView() {
 
       {/* Tab content */}
       {activeTab === "discover" ? (
-        <DiscoverView />
+        <DiscoverView onInstalled={() => setActiveTab("my-pipes")} />
       ) : (
         <PipesSection />
       )}
@@ -262,7 +266,7 @@ export function PipeStoreView() {
 
 // --- Discover View ---
 
-function DiscoverView() {
+function DiscoverView({ onInstalled }: { onInstalled?: () => void }) {
   const { settings } = useSettings();
   const { toast } = useToast();
   const token = settings.user?.token;
@@ -466,6 +470,14 @@ function DiscoverView() {
       // Invalidate cache and update installed names
       apiCache.invalidate("pipes/installed");
       setInstalledNames((prev) => new Set([...prev, pipeName]));
+
+      // Set sessionStorage so PipesSection picks it up when it mounts on the my-pipes tab
+      const pipeConnections: string[] = data.connections || [];
+      if (pipeConnections.length > 0) {
+        sessionStorage.setItem(`justInstalled:${pipeName}`, "1");
+      }
+      // Switch to my-pipes tab — PipesSection mounts and auto-opens the connection modal
+      onInstalled?.();
     } catch (err: any) {
       toast({
         title: "failed to install pipe",
@@ -725,6 +737,7 @@ function DiscoverView() {
           toast({ title: "pipe published to store" });
         }}
       />
+
     </div>
   );
 }
@@ -751,23 +764,11 @@ function FeaturedCard({
       className="flex-shrink-0 w-[300px] snap-start group cursor-pointer"
       onClick={onClick}
     >
-      <div className="border border-border bg-card hover:bg-accent/50 transition-colors duration-150 rounded-none p-5 space-y-3 h-full">
-        <div className="flex items-start justify-between">
-          <div className="flex items-start gap-3">
-            <div className="text-3xl bg-muted rounded-none h-12 w-12 flex items-center justify-center flex-shrink-0">
-              {pipe.icon || "🔧"}
-            </div>
-            <div className="min-w-0">
-              <div className="flex items-center gap-1.5">
-                <span className="text-sm font-semibold truncate">{pipe.title}</span>
-              </div>
-              <div className="flex items-center gap-1 text-xs text-muted-foreground mt-0.5">
-                <span className="truncate">{pipe.author}</span>
-                {pipe.author_verified && (
-                  <BadgeCheck className="h-3 w-3 text-foreground flex-shrink-0" />
-                )}
-              </div>
-            </div>
+      <div className="border border-border bg-card hover:bg-accent/50 transition-colors duration-150 rounded-none p-5 h-full flex flex-col">
+        {/* Header: icon + action */}
+        <div className="flex items-start justify-between gap-3">
+          <div className="text-3xl bg-muted rounded-none h-12 w-12 flex items-center justify-center flex-shrink-0">
+            {pipe.icon || "🔧"}
           </div>
           <Button
             size="sm"
@@ -795,20 +796,27 @@ function FeaturedCard({
           </Button>
         </div>
 
-        <p className="text-xs text-muted-foreground line-clamp-2 leading-relaxed">
+        {/* Title — full width, no truncation */}
+        <h4 className="text-sm font-semibold mt-3 line-clamp-2 leading-snug">{pipe.title}</h4>
+        <div className="flex items-center gap-1 text-xs text-muted-foreground mt-1">
+          <span className="truncate">{pipe.author}</span>
+          {pipe.author_verified && (
+            <BadgeCheck className="h-3 w-3 text-foreground flex-shrink-0" />
+          )}
+        </div>
+
+        <p className="text-xs text-muted-foreground line-clamp-2 mt-2 leading-relaxed flex-1">
           {pipe.description}
         </p>
 
-        <div className="flex items-center justify-between">
+        <div className="flex items-center justify-between mt-3 pt-3 border-t border-border">
           <Badge variant="secondary" className="text-[10px] px-2 py-0.5 font-normal rounded-none">
             {pipe.category}
           </Badge>
-          <div className="flex items-center gap-3 text-xs text-muted-foreground">
-            <span className="flex items-center gap-1">
-              <Download className="h-3 w-3" />
-              {formatCount(pipe.install_count ?? 0)}
-            </span>
-          </div>
+          <span className="flex items-center gap-1 text-xs text-muted-foreground">
+            <Download className="h-3 w-3" />
+            {formatCount(pipe.install_count ?? 0)}
+          </span>
         </div>
       </div>
     </div>
@@ -838,77 +846,59 @@ function PipeCard({
   return (
     <div
       onClick={onClick}
-      className="border border-border bg-card hover:bg-accent/50 transition-colors duration-150 rounded-none p-5 cursor-pointer group"
+      className="border border-border bg-card hover:bg-accent/50 transition-colors duration-150 rounded-none p-5 cursor-pointer group flex flex-col"
     >
-      <div className="flex items-start gap-3">
+      {/* Header: icon + action */}
+      <div className="flex items-start justify-between gap-3">
         <div className="text-2xl bg-muted rounded-none h-11 w-11 flex items-center justify-center flex-shrink-0">
           {pipe.icon || "🔧"}
         </div>
-        <div className="min-w-0 flex-1">
-          <div className="flex items-start justify-between gap-2">
-            <div className="min-w-0">
-              <div className="text-sm font-semibold truncate">{pipe.title}</div>
-              <div className="flex items-center gap-1 text-xs text-muted-foreground mt-0.5">
-                <span className="truncate">{pipe.author}</span>
-                {pipe.author_verified && (
-                  <BadgeCheck className="h-3 w-3 text-foreground flex-shrink-0" />
-                )}
-              </div>
-            </div>
-            <Button
-              size="sm"
-              variant={isInstalled && !hasUpdate ? "outline" : "default"}
-              className={cn(
-                "h-7 px-3 text-xs font-semibold rounded-none uppercase tracking-wide flex-shrink-0",
-                isInstalled && !hasUpdate && "pointer-events-none",
-                hasUpdate && "bg-amber-500 hover:bg-amber-600 text-white"
-              )}
-              disabled={installing || (isInstalled && !hasUpdate)}
-              onClick={(e) => {
-                e.stopPropagation();
-                onInstall();
-              }}
-            >
-              {installing ? (
-                <Loader2 className="h-3 w-3 animate-spin" />
-              ) : hasUpdate ? (
-                "UPDATE"
-              ) : isInstalled ? (
-                "INSTALLED"
-              ) : (
-                "GET"
-              )}
-            </Button>
-          </div>
-        </div>
+        <Button
+          size="sm"
+          variant={isInstalled && !hasUpdate ? "outline" : "default"}
+          className={cn(
+            "h-7 px-3 text-xs font-semibold rounded-none uppercase tracking-wide flex-shrink-0",
+            isInstalled && !hasUpdate && "pointer-events-none",
+            hasUpdate && "bg-amber-500 hover:bg-amber-600 text-white"
+          )}
+          disabled={installing || (isInstalled && !hasUpdate)}
+          onClick={(e) => {
+            e.stopPropagation();
+            onInstall();
+          }}
+        >
+          {installing ? (
+            <Loader2 className="h-3 w-3 animate-spin" />
+          ) : hasUpdate ? (
+            "UPDATE"
+          ) : isInstalled ? (
+            "INSTALLED"
+          ) : (
+            "GET"
+          )}
+        </Button>
       </div>
 
-      <p className="text-xs text-muted-foreground line-clamp-2 mt-3 leading-relaxed">
+      {/* Title — full width, no truncation */}
+      <h4 className="text-sm font-semibold mt-3 line-clamp-2 leading-snug">{pipe.title}</h4>
+      <div className="flex items-center gap-1 text-xs text-muted-foreground mt-1">
+        <span className="truncate">{pipe.author}</span>
+        {pipe.author_verified && (
+          <BadgeCheck className="h-3 w-3 text-foreground flex-shrink-0" />
+        )}
+      </div>
+
+      {/* Description */}
+      <p className="text-xs text-muted-foreground line-clamp-2 mt-2 leading-relaxed flex-1">
         {pipe.description}
       </p>
 
-      {permissionPills.length > 0 && (
-        <div className="flex flex-wrap gap-1 mt-2.5">
-          {permissionPills.slice(0, 3).map((p) => (
-            <Badge
-              key={p.key}
-              variant="outline"
-              className="text-[10px] px-1.5 py-0 gap-0.5 font-normal rounded-none"
-            >
-              {p.icon}
-              {p.label}
-            </Badge>
-          ))}
-          {permissionPills.length > 3 && (
-            <Badge variant="outline" className="text-[10px] px-1.5 py-0 font-normal rounded-none">
-              +{permissionPills.length - 3}
-            </Badge>
-          )}
-        </div>
-      )}
-
-      <div className="flex items-center gap-3 mt-3 text-xs text-muted-foreground">
-        <span className="flex items-center gap-1">
+      {/* Footer: category + stats */}
+      <div className="flex items-center justify-between mt-3 pt-3 border-t border-border">
+        <Badge variant="secondary" className="text-[10px] px-2 py-0.5 font-normal rounded-none">
+          {pipe.category}
+        </Badge>
+        <span className="flex items-center gap-1 text-xs text-muted-foreground">
           <Download className="h-3 w-3" />
           {formatCount(pipe.install_count ?? 0)}
         </span>

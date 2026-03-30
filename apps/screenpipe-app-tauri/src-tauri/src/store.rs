@@ -222,6 +222,14 @@ pub struct SettingsStore {
     #[serde(rename = "showRestartNotifications", default)]
     pub show_restart_notifications: bool,
 
+    /// When true, apply macOS vibrancy effect to the sidebar for a translucent look.
+    #[serde(rename = "translucentSidebar", default)]
+    pub translucent_sidebar: bool,
+
+    /// UI theme: "light", "dark", or "system".
+    #[serde(rename = "uiTheme", default = "default_ui_theme")]
+    pub ui_theme: String,
+
     /// Catch-all for fields added by the frontend (e.g. chatHistory)
     /// that the Rust struct doesn't know about. Without this, `save()` would
     /// serialize only known fields and silently wipe frontend-only data.
@@ -235,6 +243,10 @@ fn generate_device_id() -> String {
 
 fn default_true() -> bool {
     true
+}
+
+fn default_ui_theme() -> String {
+    "system".to_string()
 }
 
 fn default_overlay_mode() -> String {
@@ -259,7 +271,7 @@ pub enum AIProviderType {
     NativeOllama,
     #[serde(rename = "custom")]
     Custom,
-    #[serde(rename = "screenpipe-cloud")]
+    #[serde(rename = "screenpipe-cloud", alias = "claude-code")]
     ScreenpipeCloud,
     #[serde(rename = "pi", alias = "opencode")]
     Pi,
@@ -437,10 +449,9 @@ impl Default for SettingsStore {
         // Default free AI preset - works without login
         let default_free_preset = AIPreset {
             id: "screenpipe-free".to_string(),
-            prompt: r#"Rules:
-- You can analyze/view/show/access videos to the user by putting .mp4 files in a code block (we'll render it) like this: `/users/video.mp4`, use the exact, absolute, file path from file_path property
-- Do not try to embed video in links (e.g. [](.mp4) or https://.mp4) instead put the file_path in a code block using backticks
-- Do not put video in multiline code block it will not render the video (e.g. ```bash\n.mp4```) instead using inline code block with single backtick
+            prompt: r#"IMPORTANT: At the start of every conversation, read the files in .pi/skills/ directory (e.g. .pi/skills/screenpipe-api/SKILL.md and .pi/skills/screenpipe-cli/SKILL.md) before responding.
+Rules:
+- Media: use standard markdown ![description](/path/to/file.mp4) for videos and ![description](/path/to/image.jpg) for images
 - Always answer my question/intent, do not make up things
 "#.to_string(),
             provider: AIProviderType::ScreenpipeCloud,
@@ -528,6 +539,11 @@ impl Default for SettingsStore {
             show_overlay_in_screen_recording: false,
             chat_always_on_top: true,
             show_restart_notifications: false,
+            #[cfg(target_os = "macos")]
+            translucent_sidebar: true,
+            #[cfg(not(target_os = "macos"))]
+            translucent_sidebar: false,
+            ui_theme: "system".to_string(),
             extra: std::collections::HashMap::new(),
         }
     }
@@ -638,9 +654,12 @@ impl SettingsStore {
             .filter(|s| !s.trim().is_empty())
             .or_else(|| self.user.name.clone().filter(|s| !s.trim().is_empty()))
             .or_else(|| self.user.email.clone().filter(|s| !s.trim().is_empty()));
-        // Always force these on for the engine
-        settings.enable_input_capture = true;
-        settings.enable_accessibility = true;
+        // Legacy fields — always true, no-op but kept for serde compat
+        #[allow(deprecated)]
+        {
+            settings.enable_input_capture = true;
+            settings.enable_accessibility = true;
+        }
         settings
     }
 
@@ -704,18 +723,21 @@ pub fn init_store(app: &AppHandle) -> Result<SettingsStore, String> {
         .map(|obj| !obj.contains_key("restartNotificationsDefaultedOff"))
         .unwrap_or(false);
 
-    let needs_haiku_migration = raw_obj
-        .as_ref()
-        .map(|obj| !obj.contains_key("haikuToQwenFlashMigrated"))
-        .unwrap_or(false);
-
-    let (mut store, should_save) = match SettingsStore::get(app) {
-        Ok(Some(store)) => (
-            store,
-            should_persist_restart_notification_migration || needs_haiku_migration,
-        ),
-        Ok(None) => (SettingsStore::default(), true), // New store, save defaults
+    let is_new_store;
+    let (mut store, mut should_save) = match SettingsStore::get(app) {
+        Ok(Some(store)) => {
+            is_new_store = false;
+            (
+                store,
+                should_persist_restart_notification_migration,
+            )
+        }
+        Ok(None) => {
+            is_new_store = true;
+            (SettingsStore::default(), true) // New store, save defaults
+        }
         Err(e) => {
+            is_new_store = false;
             // Fallback to defaults when deserialization fails (e.g., corrupted store)
             // DON'T save - preserve original store in case it can be manually recovered
             // This prevents crashes from invalid values like negative integers in u32 fields
@@ -727,22 +749,42 @@ pub fn init_store(app: &AppHandle) -> Result<SettingsStore, String> {
         }
     };
 
-    // One-time migration: move default Haiku users to Qwen3.5 Flash
-    if needs_haiku_migration {
-        for preset in &mut store.ai_presets {
-            let is_screenpipe = matches!(
-                preset.provider,
-                AIProviderType::Pi | AIProviderType::ScreenpipeCloud
+    // Tier detection. Two cases:
+    // - New install: detect tier AND apply tier defaults (video_quality, power_mode, etc.)
+    // - Existing user upgrading: detect tier for DB/channel config but do NOT override
+    //   their existing capture settings (they may have customized video_quality etc.)
+    // Also re-detect if the stored tier doesn't match current hardware classification
+    // (e.g. tier boundaries changed in an update).
+    {
+        let detected = screenpipe_config::detect_tier();
+        let stored_tier = store.recording.device_tier.as_deref()
+            .and_then(screenpipe_config::DeviceTier::from_str_loose);
+        if stored_tier != Some(detected) {
+            tracing::info!(
+                "hardware tier changed: {:?} -> {:?}",
+                stored_tier, detected
             );
-            if is_screenpipe && preset.model == "claude-haiku-4-5" {
-                tracing::info!("migrating default Haiku preset to Qwen3.5 Flash");
-                preset.model = "qwen/qwen3.5-flash-02-23".to_string();
+            if is_new_store || store.recording.device_tier.is_none() {
+                screenpipe_config::apply_tier_defaults(&mut store.recording, detected);
             }
+            store.recording.device_tier = Some(detected.as_str().to_string());
+            should_save = true;
         }
-        // Persist the flag so this runs only once
-        store
-            .extra
-            .insert("haikuToQwenFlashMigrated".to_string(), Value::Bool(true));
+
+        // Unconditional safety guard: prevent parakeet/parakeet-mlx on platforms
+        // where it will crash (Low tier = OOM, macOS < 26 = MLX segfault).
+        if screenpipe_config::is_engine_unsafe(&store.recording.audio_transcription_engine, detected) {
+            let safe = screenpipe_config::best_engine_for_platform(detected);
+            tracing::warn!(
+                "engine {} is unsafe on this platform (tier={:?}, macOS={:?}) — switching to {}",
+                store.recording.audio_transcription_engine,
+                detected,
+                screenpipe_config::macos_major_version(),
+                safe,
+            );
+            store.recording.audio_transcription_engine = safe.to_string();
+            should_save = true;
+        }
     }
 
     if should_save {

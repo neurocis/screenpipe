@@ -16,6 +16,9 @@ on:
 permissions:
   contents: write
 
+env:
+  GIT_LFS_SKIP_SMUDGE: 1
+
 jobs:
   check_commit:
     runs-on: ubuntu-latest
@@ -122,8 +125,10 @@ jobs:
           if [[ "${{ matrix.target }}" == "aarch64-apple-darwin" ]]; then
             export CFLAGS="-mcpu=apple-m1 -U__ARM_FEATURE_MATMUL_INT8"
             export CXXFLAGS="-mcpu=apple-m1 -U__ARM_FEATURE_MATMUL_INT8"
+            cargo build --release --features metal,parakeet-mlx --target ${{ matrix.target }}
+          else
+            cargo build --release --features metal --target ${{ matrix.target }}
           fi
-          cargo build --release --features metal --target ${{ matrix.target }}
 
       - name: Upload debug symbols to Sentry
         env:
@@ -200,6 +205,17 @@ jobs:
         run: |
           mkdir -p screenpipe-${{ env.VERSION }}-${{ matrix.target }}/bin
           cp target/${{ matrix.target }}/release/screenpipe screenpipe-${{ env.VERSION }}-${{ matrix.target }}/bin/
+
+          # Bundle mlx.metallib next to CLI binary (macOS aarch64 only)
+          # MLX searches for mlx.metallib next to the binary at runtime.
+          # CI cmake uses JIT mode so metallib isn't compiled — download pre-built from GitHub releases.
+          if [[ "${{ matrix.target }}" == "aarch64-apple-darwin" ]]; then
+            curl -L -f -o screenpipe-${{ env.VERSION }}-${{ matrix.target }}/bin/mlx.metallib \
+              "https://github.com/screenpipe/screenpipe/releases/download/mlx-metallib-v0.2.0/mlx.metallib" \
+              && echo "✅ Bundled mlx.metallib for CLI ($(du -h screenpipe-${{ env.VERSION }}-${{ matrix.target }}/bin/mlx.metallib | cut -f1))" \
+              || echo "⚠️ Failed to download mlx.metallib"
+          fi
+
           tar -czf screenpipe-${{ env.VERSION }}-${{ matrix.target }}.tar.gz -C screenpipe-${{ env.VERSION }}-${{ matrix.target }} .
 
       - name: Calculate SHA256
@@ -312,6 +328,9 @@ jobs:
           CARGO_PROFILE_RELEASE_PANIC: "abort"
           CARGO_PROFILE_RELEASE_INCREMENTAL: "false"
           RUSTFLAGS: "-C link-arg=/LTCG"
+          # Cap MSVC codegen at AVX2 — prevent AVX-512 on Lunar Lake etc.
+          CFLAGS: "/arch:AVX2"
+          CXXFLAGS: "/arch:AVX2"
           ORT_STRATEGY: system
           ORT_LIB_LOCATION: ${{ github.workspace }}/apps/screenpipe-app-tauri/src-tauri/onnxruntime-win-x64-1.19.2
           OPENBLAS_PATH: ${{ github.workspace }}/apps/screenpipe-app-tauri/src-tauri/openblas

@@ -45,17 +45,22 @@ struct PendingTranscription {
     file_path: String,
 }
 
-/// Default maximum batch duration in seconds when no user override is set.
+/// Maximum batch duration in seconds per engine.
 /// Audio is encoded as MP3 (64 kbps mono 16 kHz) before upload, so durations
 /// are bounded by the compressed size, not raw WAV.
 ///
 /// - Deepgram via Cloudflare: 100 MB upload limit ÷ 64 kbps ≈ 3.5 h → cap at 5000 s (~83 min)
-/// - OpenAI-compatible: 25 MB limit ÷ 64 kbps ≈ 52 min → cap at 3000 s (~50 min)
-/// - Local Whisper / Qwen-ASR: quality degrades past ~10 min → cap at 600 s
+/// - OpenAI-compatible: user-configurable (unknown engine limits), default 3000 s (~50 min)
+/// - Parakeet: ONNX int8 encoder handles up to ~52s but quality degrades past 30s.
+///   Benchmarked: full audio = 33.1% WER, 30s chunks = 33.9% WER (best chunked).
+///   Cap at 45s — the engine layer safety-chunks at 30s if exceeded.
+/// - Local Whisper: processes in 30s windows with context carryover → cap at 600 s (10 min)
+/// - Qwen3-ASR: similar to Whisper architecture → cap at 600 s (10 min)
 pub fn default_max_batch_duration_secs(engine: &AudioTranscriptionEngine) -> u64 {
     match engine {
         AudioTranscriptionEngine::Deepgram => 5000,
         AudioTranscriptionEngine::OpenAICompatible => 3000,
+        AudioTranscriptionEngine::Parakeet => 45,
         _ => 600,
     }
 }
@@ -137,8 +142,13 @@ pub async fn reconcile_untranscribed(
     );
 
     // Group consecutive chunks by device for batched transcription.
-    let max_duration =
-        batch_max_duration_secs.unwrap_or_else(|| default_max_batch_duration_secs(&audio_engine));
+    // User override only applies to OpenAI-compatible (unknown engine limits).
+    // All other engines use hardcoded optimal defaults.
+    let max_duration = match *audio_engine {
+        AudioTranscriptionEngine::OpenAICompatible => batch_max_duration_secs
+            .unwrap_or_else(|| default_max_batch_duration_secs(&audio_engine)),
+        _ => default_max_batch_duration_secs(&audio_engine),
+    };
     let batches = group_chunks_by_device(&chunks, max_duration);
     debug!(
         "reconciliation: grouped into {} batches (max {}s each)",
