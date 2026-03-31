@@ -8,7 +8,18 @@ import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { useToast } from "@/components/ui/use-toast";
 import { Skeleton } from "@/components/ui/skeleton";
-import { Trash2, Check, X, Loader2, ExternalLink, Copy } from "lucide-react";
+import {
+  Trash2,
+  Check,
+  X,
+  Loader2,
+  ExternalLink,
+  Copy,
+  Search,
+  ArrowUpDown,
+  Tag,
+} from "lucide-react";
+import { Input } from "@/components/ui/input";
 
 interface MemoryRecord {
   id: number;
@@ -72,6 +83,9 @@ function MemoriesSkeleton() {
   );
 }
 
+type SortField = "created_at" | "importance";
+type SortDir = "desc" | "asc";
+
 export function MemoriesSection() {
   const { toast } = useToast();
   const [memories, setMemories] = useState<MemoryRecord[]>([]);
@@ -81,9 +95,44 @@ export function MemoriesSection() {
   const [deletingId, setDeletingId] = useState<number | null>(null);
   const [confirmDeleteId, setConfirmDeleteId] = useState<number | null>(null);
   const [copiedId, setCopiedId] = useState<number | null>(null);
+  const [editingId, setEditingId] = useState<number | null>(null);
+  const [editContent, setEditContent] = useState("");
+  const [savingId, setSavingId] = useState<number | null>(null);
+  const editRef = useRef<HTMLTextAreaElement>(null);
   const sentinelRef = useRef<HTMLDivElement>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const loadingMoreRef = useRef(false);
+
+  // search, filter & sort
+  const [searchQuery, setSearchQuery] = useState("");
+  const [debouncedQuery, setDebouncedQuery] = useState("");
+  const [activeTag, setActiveTag] = useState<string | null>(null);
+  const [sortField, setSortField] = useState<SortField>("created_at");
+  const [sortDir, setSortDir] = useState<SortDir>("desc");
+  const [allTags, setAllTags] = useState<string[]>([]);
+
+  // debounce search
+  useEffect(() => {
+    const timer = setTimeout(() => setDebouncedQuery(searchQuery), 300);
+    return () => clearTimeout(timer);
+  }, [searchQuery]);
+
+  const sortMemories = useCallback(
+    (data: MemoryRecord[]) => {
+      return [...data].sort((a, b) => {
+        const aVal =
+          sortField === "created_at"
+            ? new Date(a.created_at).getTime()
+            : a.importance;
+        const bVal =
+          sortField === "created_at"
+            ? new Date(b.created_at).getTime()
+            : b.importance;
+        return sortDir === "desc" ? bVal - aVal : aVal - bVal;
+      });
+    },
+    [sortField, sortDir],
+  );
 
   const fetchPage = useCallback(
     async (offset: number, append: boolean) => {
@@ -96,19 +145,42 @@ export function MemoriesSection() {
       try {
         const controller = new AbortController();
         const timeout = setTimeout(() => controller.abort(), 10_000);
+        const params = new URLSearchParams({
+          limit: String(PAGE_SIZE),
+          offset: String(offset),
+        });
+        if (debouncedQuery) params.set("q", debouncedQuery);
+        if (activeTag) params.set("tags", activeTag);
         const res = await fetch(
-          `http://localhost:3030/memories?limit=${PAGE_SIZE}&offset=${offset}`,
+          `http://localhost:3030/memories?${params}`,
           { signal: controller.signal },
         );
         clearTimeout(timeout);
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const data: MemoryListResponse = await res.json();
-        const sorted = data.data.sort(
-          (a, b) =>
-            new Date(b.created_at).getTime() -
-            new Date(a.created_at).getTime(),
+        const sorted = sortMemories(data.data);
+
+        // collect all unique tags
+        if (offset === 0) {
+          const tags = new Set<string>();
+          data.data.forEach((m) => m.tags.forEach((t) => tags.add(t)));
+          setAllTags((prev) => {
+            const merged = new Set([...prev, ...tags]);
+            return Array.from(merged).sort();
+          });
+        } else {
+          data.data.forEach((m) =>
+            m.tags.forEach((t) =>
+              setAllTags((prev) =>
+                prev.includes(t) ? prev : [...prev, t].sort(),
+              ),
+            ),
+          );
+        }
+
+        setMemories((prev) =>
+          append ? sortMemories([...prev, ...sorted]) : sorted,
         );
-        setMemories((prev) => (append ? [...prev, ...sorted] : sorted));
         setTotal(data.pagination.total);
       } catch (err) {
         if (offset === 0) {
@@ -124,12 +196,18 @@ export function MemoriesSection() {
         loadingMoreRef.current = false;
       }
     },
-    [toast],
+    [toast, debouncedQuery, activeTag, sortMemories],
   );
 
+  // fetch on mount + refetch when search/tag filter changes
   useEffect(() => {
     fetchPage(0, false);
-  }, [fetchPage]);
+  }, [debouncedQuery, activeTag]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // re-sort locally when sort changes (no refetch needed)
+  useEffect(() => {
+    setMemories((prev) => (prev.length > 0 ? sortMemories(prev) : prev));
+  }, [sortField, sortDir, sortMemories]);
 
   // infinite scroll via IntersectionObserver
   useEffect(() => {
@@ -174,13 +252,62 @@ export function MemoriesSection() {
     }
   };
 
+  const startEditing = (memory: MemoryRecord) => {
+    setEditingId(memory.id);
+    setEditContent(memory.content);
+    setTimeout(() => editRef.current?.focus(), 0);
+  };
+
+  const saveEdit = async (id: number) => {
+    const trimmed = editContent.trim();
+    const memory = memories.find((m) => m.id === id);
+    if (!trimmed || trimmed === memory?.content) {
+      setEditingId(null);
+      return;
+    }
+    setSavingId(id);
+    try {
+      const res = await fetch(`http://localhost:3030/memories/${id}`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ content: trimmed }),
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      setMemories((prev) =>
+        prev.map((m) => (m.id === id ? { ...m, content: trimmed } : m)),
+      );
+      toast({ title: "memory updated" });
+    } catch (err) {
+      toast({
+        title: "failed to update memory",
+        description: String(err),
+        variant: "destructive",
+      });
+    } finally {
+      setSavingId(null);
+      setEditingId(null);
+    }
+  };
+
   return (
     <div className="space-y-4 h-full flex flex-col">
       <p className="text-muted-foreground text-sm mb-4">
         facts and preferences the AI has learned from your activity
       </p>
 
-      <div className="flex items-center gap-2">
+      {/* search bar */}
+      <div className="relative">
+        <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 h-3.5 w-3.5 text-muted-foreground" />
+        <Input
+          placeholder="search memories..."
+          value={searchQuery}
+          onChange={(e) => setSearchQuery(e.target.value)}
+          className="pl-8 h-8 text-sm"
+        />
+      </div>
+
+      {/* filters row */}
+      <div className="flex items-center gap-2 flex-wrap">
         {loading ? (
           <Skeleton className="h-6 w-12 rounded-full" />
         ) : total > 0 ? (
@@ -188,17 +315,94 @@ export function MemoriesSection() {
             {total}
           </Badge>
         ) : null}
+
+        {/* tag filter pills */}
+        {allTags.length > 0 && (
+          <>
+            <div className="w-px h-4 bg-border" />
+            {allTags.slice(0, 8).map((tag) => (
+              <button
+                key={tag}
+                onClick={() =>
+                  setActiveTag((prev) => (prev === tag ? null : tag))
+                }
+                className={`inline-flex items-center gap-1 px-2 py-0.5 text-[10px] rounded-full border transition-colors ${
+                  activeTag === tag
+                    ? "bg-foreground text-background border-foreground"
+                    : "border-border text-muted-foreground hover:bg-muted"
+                }`}
+              >
+                <Tag className="h-2.5 w-2.5" />
+                {tag}
+              </button>
+            ))}
+          </>
+        )}
+
+        {/* sort toggle */}
+        <div className="ml-auto flex items-center gap-1">
+          <button
+            onClick={() => {
+              if (sortField === "created_at") {
+                setSortDir((d) => (d === "desc" ? "asc" : "desc"));
+              } else {
+                setSortField("created_at");
+                setSortDir("desc");
+              }
+            }}
+            className={`inline-flex items-center gap-1 px-2 py-0.5 text-[10px] rounded border transition-colors ${
+              sortField === "created_at"
+                ? "bg-foreground/10 border-foreground/20"
+                : "border-border text-muted-foreground hover:bg-muted"
+            }`}
+          >
+            <ArrowUpDown className="h-2.5 w-2.5" />
+            {sortField === "created_at" && sortDir === "desc"
+              ? "newest"
+              : sortField === "created_at" && sortDir === "asc"
+                ? "oldest"
+                : "date"}
+          </button>
+          <button
+            onClick={() => {
+              if (sortField === "importance") {
+                setSortDir((d) => (d === "desc" ? "asc" : "desc"));
+              } else {
+                setSortField("importance");
+                setSortDir("desc");
+              }
+            }}
+            className={`inline-flex items-center gap-1 px-2 py-0.5 text-[10px] rounded border transition-colors ${
+              sortField === "importance"
+                ? "bg-foreground/10 border-foreground/20"
+                : "border-border text-muted-foreground hover:bg-muted"
+            }`}
+          >
+            <ArrowUpDown className="h-2.5 w-2.5" />
+            {sortField === "importance" && sortDir === "desc"
+              ? "important"
+              : sortField === "importance" && sortDir === "asc"
+                ? "least"
+                : "importance"}
+          </button>
+        </div>
       </div>
 
       {loading ? (
         <MemoriesSkeleton />
       ) : memories.length === 0 ? (
         <div className="text-sm text-muted-foreground py-8 space-y-2">
-          <p>no memories yet</p>
-          <p className="text-xs">
-            memories are created when the AI learns something about you during
-            chat conversations. try asking the AI to remember something.
+          <p>
+            {debouncedQuery || activeTag
+              ? "no memories match your search"
+              : "no memories yet"}
           </p>
+          {!debouncedQuery && !activeTag && (
+            <p className="text-xs">
+              memories are created when the AI learns something about you during
+              chat conversations. try asking the AI to remember something.
+            </p>
+          )}
         </div>
       ) : (
         <div
@@ -213,8 +417,39 @@ export function MemoriesSection() {
                 key={memory.id}
                 className="group flex items-start gap-2 rounded-md border border-border p-2.5 transition-colors hover:bg-muted/30"
               >
-                <div className="flex-1 min-w-0">
-                  <p className="text-sm text-foreground">{memory.content}</p>
+                <div
+                  className="flex-1 min-w-0 cursor-text"
+                  onClick={() => {
+                    if (editingId !== memory.id) startEditing(memory);
+                  }}
+                >
+                  {editingId === memory.id ? (
+                    <textarea
+                      ref={editRef}
+                      value={editContent}
+                      onChange={(e) => setEditContent(e.target.value)}
+                      onBlur={() => saveEdit(memory.id)}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter" && !e.shiftKey) {
+                          e.preventDefault();
+                          saveEdit(memory.id);
+                        }
+                        if (e.key === "Escape") {
+                          setEditingId(null);
+                        }
+                      }}
+                      disabled={savingId === memory.id}
+                      className="text-sm text-foreground w-full bg-transparent border border-foreground/20 rounded px-1.5 py-1 resize-none focus:outline-none focus:border-foreground/40"
+                      rows={Math.min(6, Math.max(2, editContent.split("\n").length))}
+                    />
+                  ) : (
+                    <p className="text-sm text-foreground">
+                      {memory.content}
+                      {savingId === memory.id && (
+                        <Loader2 className="inline h-3 w-3 ml-1 animate-spin" />
+                      )}
+                    </p>
+                  )}
                   <div className="flex items-center gap-2 mt-1 flex-wrap">
                     <span className="text-xs text-muted-foreground">
                       {timeAgo(memory.created_at)}

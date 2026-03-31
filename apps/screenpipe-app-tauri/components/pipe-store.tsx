@@ -53,6 +53,7 @@ import {
   ArrowLeft,
   ExternalLink,
   GitFork,
+  Star,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { useSettings } from "@/lib/hooks/use-settings";
@@ -62,6 +63,16 @@ import remarkGfm from "remark-gfm";
 import posthog from "posthog-js";
 import { PipesSection } from "@/components/settings/pipes-section";
 import { ChatPrefillData } from "@/lib/chat-utils";
+import {
+  IntegrationIcon,
+  IntegrationInfo,
+} from "@/components/settings/connections-section";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
+  TooltipProvider,
+} from "@/components/ui/tooltip";
 // --- Types ---
 
 interface StorePipe {
@@ -226,6 +237,76 @@ function normalizePipe(raw: any): any {
 
 // --- Main Unified Component ---
 
+function ConnectionsStrip() {
+  const [integrations, setIntegrations] = useState<IntegrationInfo[]>([]);
+
+  useEffect(() => {
+    const cached = apiCache.get<IntegrationInfo[]>("connections/strip");
+    if (cached) {
+      setIntegrations(cached);
+      return;
+    }
+    fetch("http://localhost:3030/connections")
+      .then((r) => r.json())
+      .then((data) => {
+        const list: IntegrationInfo[] = data.data || [];
+        // only show integrations that have fields (API keys) or OAuth — skip empty ones
+        const relevant = list.filter((i) => i.fields.length > 0 || i.is_oauth);
+        apiCache.set("connections/strip", relevant, 30_000);
+        setIntegrations(relevant);
+      })
+      .catch(() => {});
+  }, []);
+
+  if (integrations.length === 0) return null;
+
+  const connected = integrations.filter((i) => i.connected);
+  const disconnected = integrations.filter((i) => !i.connected);
+  const sorted = [...connected, ...disconnected];
+
+  return (
+    <TooltipProvider delayDuration={200}>
+      <div className="flex items-center gap-1.5 mb-4 flex-wrap">
+        <span className="text-[10px] text-muted-foreground font-medium mr-1 uppercase tracking-wider">
+          connections
+        </span>
+        {sorted.map((integration) => (
+          <Tooltip key={integration.id}>
+            <TooltipTrigger asChild>
+              <button
+                onClick={() => {
+                  sessionStorage.setItem("openConnection", integration.id);
+                  // trigger settings modal to connections section
+                  window.dispatchEvent(
+                    new CustomEvent("open-settings", {
+                      detail: { section: "connections" },
+                    })
+                  );
+                }}
+                className={cn(
+                  "relative flex items-center justify-center w-7 h-7 border rounded transition-colors",
+                  integration.connected
+                    ? "border-foreground/20 hover:border-foreground/40"
+                    : "border-dashed border-muted-foreground/20 opacity-50 hover:opacity-80"
+                )}
+              >
+                <IntegrationIcon icon={integration.icon} />
+                {integration.connected && (
+                  <div className="absolute -bottom-0.5 -right-0.5 w-2 h-2 rounded-full bg-foreground" />
+                )}
+              </button>
+            </TooltipTrigger>
+            <TooltipContent side="bottom" className="text-xs">
+              {integration.name}
+              {integration.connected ? " · connected" : " · not set up"}
+            </TooltipContent>
+          </Tooltip>
+        ))}
+      </div>
+    </TooltipProvider>
+  );
+}
+
 export function PipeStoreView() {
   const [activeTab, setActiveTab] = useState<"discover" | "my-pipes">("my-pipes");
 
@@ -236,6 +317,9 @@ export function PipeStoreView() {
 
   return (
     <div className="space-y-0">
+      {/* Connections strip */}
+      <ConnectionsStrip />
+
       {/* Tab bar */}
       <div className="flex items-center gap-6 border-b border-border pb-0 mb-6">
         {tabs.map(({ key, label }) => (
@@ -559,8 +643,6 @@ function DiscoverView({ onInstalled }: { onInstalled?: () => void }) {
     });
   }, [pipes, category]);
 
-  const featuredPipes = filteredPipes.filter((p) => p.featured);
-
   // If showing detail view, render full-width detail panel
   if (showDetail) {
     return (
@@ -661,28 +743,6 @@ function DiscoverView({ onInstalled }: { onInstalled?: () => void }) {
         </div>
       </div>
 
-      {/* Featured Section */}
-      {featuredPipes.length > 0 && !debouncedQuery && category === "All" && (
-        <div>
-          <h4 className="text-xs font-medium text-muted-foreground mb-3 uppercase tracking-widest">
-            Featured
-          </h4>
-          <div className="flex gap-4 overflow-x-auto pb-3 -mx-1 px-1 snap-x">
-            {featuredPipes.map((pipe) => (
-              <FeaturedCard
-                key={pipe.slug}
-                pipe={pipe}
-                isInstalled={installedNames.has(pipe.slug)}
-                hasUpdate={!!availableUpdates[pipe.slug]}
-                onInstall={() => handleInstall(pipe.slug)}
-                installing={installing === pipe.slug}
-                onClick={() => openDetail(pipe.slug)}
-              />
-            ))}
-          </div>
-        </div>
-      )}
-
       {/* Pipe Grid */}
       {loading ? (
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
@@ -713,7 +773,7 @@ function DiscoverView({ onInstalled }: { onInstalled?: () => void }) {
         </Card>
       ) : (
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-          {filteredPipes.filter((p) => !p.featured || !!debouncedQuery || category !== "All").map((pipe) => (
+          {[...filteredPipes].sort((a, b) => (b.featured ? 1 : 0) - (a.featured ? 1 : 0)).map((pipe) => (
             <PipeCard
               key={pipe.slug}
               pipe={pipe}
@@ -743,85 +803,6 @@ function DiscoverView({ onInstalled }: { onInstalled?: () => void }) {
 }
 
 // --- Sub-components ---
-
-function FeaturedCard({
-  pipe,
-  isInstalled,
-  hasUpdate,
-  onInstall,
-  installing,
-  onClick,
-}: {
-  pipe: StorePipe;
-  isInstalled: boolean;
-  hasUpdate?: boolean;
-  onInstall: () => void;
-  installing: boolean;
-  onClick: () => void;
-}) {
-  return (
-    <div
-      className="flex-shrink-0 w-[300px] snap-start group cursor-pointer"
-      onClick={onClick}
-    >
-      <div className="border border-border bg-card hover:bg-accent/50 transition-colors duration-150 rounded-none p-5 h-full flex flex-col">
-        {/* Header: icon + action */}
-        <div className="flex items-start justify-between gap-3">
-          <div className="text-3xl bg-muted rounded-none h-12 w-12 flex items-center justify-center flex-shrink-0">
-            {pipe.icon || "🔧"}
-          </div>
-          <Button
-            size="sm"
-            variant={isInstalled && !hasUpdate ? "outline" : "default"}
-            className={cn(
-              "h-7 px-3 text-xs font-semibold rounded-none uppercase tracking-wide flex-shrink-0",
-              isInstalled && !hasUpdate && "pointer-events-none",
-              hasUpdate && "bg-amber-500 hover:bg-amber-600 text-white"
-            )}
-            disabled={installing || (isInstalled && !hasUpdate)}
-            onClick={(e) => {
-              e.stopPropagation();
-              onInstall();
-            }}
-          >
-            {installing ? (
-              <Loader2 className="h-3 w-3 animate-spin" />
-            ) : hasUpdate ? (
-              "UPDATE"
-            ) : isInstalled ? (
-              "INSTALLED"
-            ) : (
-              "GET"
-            )}
-          </Button>
-        </div>
-
-        {/* Title — full width, no truncation */}
-        <h4 className="text-sm font-semibold mt-3 line-clamp-2 leading-snug">{pipe.title}</h4>
-        <div className="flex items-center gap-1 text-xs text-muted-foreground mt-1">
-          <span className="truncate">{pipe.author}</span>
-          {pipe.author_verified && (
-            <BadgeCheck className="h-3 w-3 text-foreground flex-shrink-0" />
-          )}
-        </div>
-
-        <p className="text-xs text-muted-foreground line-clamp-2 mt-2 leading-relaxed flex-1">
-          {pipe.description}
-        </p>
-
-        <div className="flex items-center justify-between mt-3 pt-3 border-t border-border">
-          <Badge variant="secondary" className="text-[10px] px-2 py-0.5 font-normal rounded-none">
-            {pipe.category}
-          </Badge>
-          <span className="flex items-center gap-1 text-xs text-muted-foreground">
-            <Download className="h-3 w-3" />
-            {formatCount(pipe.install_count ?? 0)}
-          </span>
-        </div>
-      </div>
-    </div>
-  );
-}
 
 function PipeCard({
   pipe,
@@ -895,9 +876,14 @@ function PipeCard({
 
       {/* Footer: category + stats */}
       <div className="flex items-center justify-between mt-3 pt-3 border-t border-border">
-        <Badge variant="secondary" className="text-[10px] px-2 py-0.5 font-normal rounded-none">
-          {pipe.category}
-        </Badge>
+        <div className="flex items-center gap-1.5">
+          {pipe.featured && (
+            <Star className="h-3 w-3 fill-amber-400 text-amber-400 flex-shrink-0" />
+          )}
+          <Badge variant="secondary" className="text-[10px] px-2 py-0.5 font-normal rounded-none">
+            {pipe.category}
+          </Badge>
+        </div>
         <span className="flex items-center gap-1 text-xs text-muted-foreground">
           <Download className="h-3 w-3" />
           {formatCount(pipe.install_count ?? 0)}
