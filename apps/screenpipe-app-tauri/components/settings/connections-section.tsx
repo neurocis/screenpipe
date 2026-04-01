@@ -398,12 +398,14 @@ function ClaudePanel({ onConnected }: { onConnected?: () => void }) {
             <summary className="cursor-pointer hover:text-foreground">didn&apos;t work? troubleshooting steps</summary>
             <ol className="mt-1.5 ml-4 list-decimal space-y-1">
               <li>
-                <button className="underline hover:text-foreground" onClick={() => mcpbPath && revealItemInDir(mcpbPath)}>
-                  show the .mcpb file
-                </button>
-                {" "}then drag and drop it into claude desktop&apos;s window
+                open claude desktop → developer → extensions
               </li>
-              <li>or in claude: developer → extensions → install extension → select the file</li>
+              <li>
+                <button className="underline hover:text-foreground" onClick={() => mcpbPath && revealItemInDir(mcpbPath)}>
+                  click here to show the .mcpb file
+                </button>
+                {" "}then drag it into the extensions panel
+              </li>
               <li>if nothing works, reinstall claude desktop to fix file associations</li>
             </ol>
           </details>
@@ -702,7 +704,7 @@ function BrowserExtensionPanel({ connected, onRefresh }: { connected: boolean; o
       </div>
 
       <div className="flex items-center gap-2">
-        <div className={`w-2 h-2 rounded-full ${connected ? "bg-green-500" : "bg-muted-foreground/30"}`} />
+        <div className={`w-2 h-2 rounded-full ${connected ? "bg-foreground" : "bg-muted-foreground/30"}`} />
         <span className="text-sm">{connected ? "connected" : "not connected"}</span>
       </div>
 

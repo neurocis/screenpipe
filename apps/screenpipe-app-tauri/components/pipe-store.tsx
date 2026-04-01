@@ -264,44 +264,55 @@ function ConnectionsStrip() {
   const disconnected = integrations.filter((i) => !i.connected);
   const sorted = [...connected, ...disconnected];
 
+  const openConnections = () => {
+    window.dispatchEvent(
+      new CustomEvent("open-settings", {
+        detail: { section: "connections" },
+      })
+    );
+  };
+
   return (
     <TooltipProvider delayDuration={200}>
-      <div className="flex items-center gap-1.5 mb-4 flex-wrap">
-        <span className="text-[10px] text-muted-foreground font-medium mr-1 uppercase tracking-wider">
-          connections
-        </span>
-        {sorted.map((integration) => (
-          <Tooltip key={integration.id}>
-            <TooltipTrigger asChild>
-              <button
-                onClick={() => {
-                  sessionStorage.setItem("openConnection", integration.id);
-                  // trigger settings modal to connections section
-                  window.dispatchEvent(
-                    new CustomEvent("open-settings", {
-                      detail: { section: "connections" },
-                    })
-                  );
-                }}
-                className={cn(
-                  "relative flex items-center justify-center w-7 h-7 border rounded transition-colors",
-                  integration.connected
-                    ? "border-foreground/20 hover:border-foreground/40"
-                    : "border-dashed border-muted-foreground/20 opacity-50 hover:opacity-80"
-                )}
-              >
-                <IntegrationIcon icon={integration.icon} />
-                {integration.connected && (
-                  <div className="absolute -bottom-0.5 -right-0.5 w-2 h-2 rounded-full bg-foreground" />
-                )}
-              </button>
-            </TooltipTrigger>
-            <TooltipContent side="bottom" className="text-xs">
-              {integration.name}
-              {integration.connected ? " · connected" : " · not set up"}
-            </TooltipContent>
-          </Tooltip>
-        ))}
+      <div className="flex items-center gap-2 mb-6">
+        <div className="flex-1 overflow-x-auto scrollbar-hide">
+          <div className="flex items-center gap-1.5 py-1">
+            {sorted.map((integration) => (
+              <Tooltip key={integration.id}>
+                <TooltipTrigger asChild>
+                  <button
+                    onClick={() => {
+                      sessionStorage.setItem("openConnection", integration.id);
+                      openConnections();
+                    }}
+                    className={cn(
+                      "relative flex items-center justify-center w-8 h-8 shrink-0 border rounded transition-colors",
+                      integration.connected
+                        ? "border-foreground/20 hover:border-foreground/40"
+                        : "border-dashed border-muted-foreground/20 opacity-40 hover:opacity-70"
+                    )}
+                  >
+                    <IntegrationIcon icon={integration.icon} />
+                    {integration.connected && (
+                      <div className="absolute -bottom-0.5 -right-0.5 w-2 h-2 rounded-full bg-foreground" />
+                    )}
+                  </button>
+                </TooltipTrigger>
+                <TooltipContent side="bottom" className="text-xs">
+                  {integration.name}
+                  {integration.connected ? " · connected" : " · not set up"}
+                </TooltipContent>
+              </Tooltip>
+            ))}
+          </div>
+        </div>
+        <button
+          onClick={openConnections}
+          className="shrink-0 flex items-center gap-1.5 px-2 py-1 text-[10px] text-muted-foreground hover:text-foreground transition-colors"
+          title="manage connections"
+        >
+          <Plug className="w-3 h-3" />
+        </button>
       </div>
     </TooltipProvider>
   );
@@ -316,7 +327,7 @@ export function PipeStoreView() {
   ];
 
   return (
-    <div className="space-y-0">
+    <div className="space-y-4">
       {/* Connections strip */}
       <ConnectionsStrip />
 
@@ -687,8 +698,7 @@ function DiscoverView({ onInstalled }: { onInstalled?: () => void }) {
       {/* Header */}
       <div className="flex items-center justify-between">
         <div>
-          <h3 className="text-xl font-semibold tracking-tight">discover pipes</h3>
-          <p className="text-sm text-muted-foreground mt-0.5">
+          <p className="text-sm text-muted-foreground">
             browse, install, and review community pipes
           </p>
         </div>

@@ -32,6 +32,7 @@ import {
   Sparkles,
   Bell,
   BarChart3,
+  History,
 } from "lucide-react";
 import { useOverlayData } from "@/app/shortcut-reminder/use-overlay-data";
 import { cn } from "@/lib/utils";
@@ -52,10 +53,12 @@ import { MeetingsSection } from "@/components/settings/meetings-section";
 import { MemoriesSection } from "@/components/settings/memories-section";
 import { NotificationsSettings } from "@/components/settings/notifications-settings";
 import { UsageSection } from "@/components/settings/usage-section";
+import { SpeakersSection } from "@/components/settings/speakers-section";
+// HomeStatsBadge is rendered inside SummaryCards (chat empty state)
 import { StandaloneChat } from "@/components/standalone-chat";
 import Timeline from "@/components/rewind/timeline";
 import { useQueryState } from "nuqs";
-import { listen } from "@tauri-apps/api/event";
+import { emit, listen } from "@tauri-apps/api/event";
 import { useSettings } from "@/lib/hooks/use-settings";
 import { useTeam } from "@/lib/hooks/use-team";
 import { useEnterprisePolicy } from "@/lib/hooks/use-enterprise-policy";
@@ -88,7 +91,8 @@ type SettingsModalSection =
   | "team"
   | "notifications"
   | "referral"
-  | "usage";
+  | "usage"
+  | "speakers";
 
 type SettingsModalSectionItem = {
   id: SettingsModalSection;
@@ -101,7 +105,7 @@ type SettingsModalSectionItem = {
 const ALL_SECTIONS = [
   "home", "timeline", "pipes", "help",
   "account", "recording", "ai", "general", "display", "shortcuts", "notifications",
-  "connections", "privacy", "storage", "meetings", "memories", "team", "referral", "usage",
+  "connections", "privacy", "storage", "meetings", "memories", "speakers", "team", "referral", "usage",
   "feedback", // backwards compat → maps to "help"
   "disk-usage", "cloud-archive", "cloud-sync", // backwards compat → maps to "storage"
 ];
@@ -125,7 +129,14 @@ function SettingsPageContent() {
   const { settings } = useSettings();
   const teamState = useTeam();
   const { isSectionHidden, needsLicenseKey, submitLicenseKey } = useEnterprisePolicy();
-  
+
+  // If current section is hidden by enterprise policy, redirect to first visible one
+  useEffect(() => {
+    if (!isSectionHidden(activeSection)) return;
+    const fallback = ["home", "timeline", "pipes"].find((s) => !isSectionHidden(s));
+    setActiveSection(fallback ?? "home");
+  }, [activeSection, isSectionHidden, setActiveSection]);
+
   // Default true: treat undefined (settings still loading) as enabled to avoid opaque flash on init
   const isTranslucent = settings?.translucentSidebar !== false;
 
@@ -308,6 +319,14 @@ function SettingsPageContent() {
   }, [openModal]);
 
   const renderMainSection = () => {
+    if (isSectionHidden(activeSection) && activeSection !== "help") {
+      return (
+        <div className="flex flex-col items-center justify-center h-full text-muted-foreground">
+          <img src="/128x128.png" alt="screenpipe" className="w-16 h-16 opacity-30 mb-4" />
+          <p className="text-sm font-mono">screenpipe</p>
+        </div>
+      );
+    }
     switch (activeSection) {
       case "home":
         return <StandaloneChat className="h-full" />;
@@ -318,7 +337,12 @@ function SettingsPageContent() {
       case "help":
         return <FeedbackSection />;
       default:
-        return <StandaloneChat className="h-full" />;
+        return (
+          <div className="flex flex-col items-center justify-center h-full text-muted-foreground">
+            <img src="/128x128.png" alt="screenpipe" className="w-16 h-16 opacity-30 mb-4" />
+            <p className="text-sm font-mono">screenpipe</p>
+          </div>
+        );
     }
   };
 
@@ -356,6 +380,8 @@ function SettingsPageContent() {
         return <ReferralSection />;
       case "usage":
         return <UsageSection />;
+      case "speakers":
+        return <SpeakersSection />;
     }
   };
 
@@ -380,6 +406,7 @@ function SettingsPageContent() {
     { id: "privacy", label: "Privacy", icon: <Shield className="h-4 w-4" />, group: "data" },
     { id: "storage", label: "Storage", icon: <HardDrive className="h-4 w-4" />, group: "data" },
     { id: "meetings", label: "Meetings", icon: <Phone className="h-4 w-4" />, group: "data" },
+    { id: "speakers", label: "Speakers", icon: <Mic className="h-4 w-4" />, group: "data" },
     { id: "memories", label: "Memories", icon: <Sparkles className="h-4 w-4" />, group: "data" },
     { id: "connections", label: "Connections", icon: <Plug className="h-4 w-4" />, group: "data" },
     { id: "team", label: "Team", icon: <Users className="h-4 w-4" />, group: "account" },
@@ -545,6 +572,7 @@ function SettingsPageContent() {
                 })}
               </div>
 
+
               {/* Spacer */}
               <div className="flex-1" />
 
@@ -633,7 +661,7 @@ function SettingsPageContent() {
                 })()}
 
                 {/* Settings */}
-                {(() => {
+                {!isSectionHidden("settings") && (() => {
                   const btn = (
                     <button
                       data-testid="nav-settings"
@@ -673,7 +701,7 @@ function SettingsPageContent() {
                 })()}
 
                 {/* Help */}
-                {(() => {
+                {!isSectionHidden("help") && (() => {
                   const isActive = activeSection === "help" && !settingsModalOpen;
                   const btn = (
                     <button
